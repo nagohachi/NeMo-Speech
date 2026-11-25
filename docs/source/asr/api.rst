@@ -174,13 +174,12 @@ and it does not decode its batch, so it logs no ``training_batch`` metrics.
 
 In multi-GPU training, ``encoder.sync_max_audio_length: false`` keeps the encoder from reading the longest length across ranks back to the host at every step.
 
-``model.encoder.compile_packed_layers: true`` runs every layer of ``ConformerEncoder.forward_sequence_packed`` through ``torch.compile`` with a dynamic frame count,
-and ``model.transf_decoder.config_dict.compile_packed_layers: true`` does the same for the blocks of ``TransformerDecoderNM.forward_packed``;
-the padded ``forward`` (evaluation and decoding) is not compiled.
-One compiled function serves the layers of both stacks (``nemo.collections.asr.parts.packed_sequence.compile_forward_packed``), and Inductor fuses the normalizations, activations, dropout, dtype conversions and residual additions around the matmuls and the attention kernels.
-The first steps compile four graphs: the first encoder layer takes the bfloat16 output of the subsampling and the other layers the float32 residual stream, and the decoder blocks differ in the same way; batches of other frame counts, utterance counts and lengths reuse them.
-Under ``DistributedDataParallel`` the layer graphs are compiled whole, without Dynamo's DDP optimizer, which would split them at gradient-bucket boundaries: the gradients of a layer reach the buckets when its backward ends.
-The values differ from the eager layers by floating-point rounding, and dropout draws its masks from Inductor's random number generator.
+``model.encoder.compile_packed_layers: true`` compiles the layers of the sequence-packed encoder forward with ``torch.compile``,
+and ``model.transf_decoder.config_dict.compile_packed_layers: true`` the blocks of the packed decoder forward,
+which speeds up the training step; evaluation and decoding run the padded forward, which is not compiled.
+The first training steps take longer while the layers compile; batches of other sizes reuse the compiled layers.
+The values differ from the uncompiled layers by floating-point rounding, and dropout draws other random masks.
+The option cannot be combined with activation checkpointing of the encoder layers: the encoder raises an error.
 
 .. _rnn-encoder-api:
 

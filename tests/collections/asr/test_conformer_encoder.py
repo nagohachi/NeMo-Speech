@@ -24,6 +24,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
+from torch._dynamo.utils import counters
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+from torch.nn.parallel import DistributedDataParallel
 
 from nemo.collections.asr.models import EncDecCTCModel
 from nemo.collections.asr.modules import transformer_encoder_utils
@@ -671,12 +675,14 @@ class TestPackedConformerEncoder:
         batch normalization) are rounding noise in both forms; the tolerance is relative to the largest gradient.
         """
         torch._dynamo.reset()
-        eager = _packed_encoder(self_attention_model=self_attention_model).train()
-        compiled = _packed_encoder(self_attention_model=self_attention_model, compile_packed_layers=True).train()
-        compiled.load_state_dict(eager.state_dict())
+        eager_encoder = _packed_encoder(self_attention_model=self_attention_model).train()
+        compiled_encoder = _packed_encoder(
+            self_attention_model=self_attention_model, compile_packed_layers=True
+        ).train()
+        compiled_encoder.load_state_dict(eager_encoder.state_dict())
         for lengths in (torch.tensor([20, 13]), torch.tensor([17, 9, 30])):
             outputs, grads = [], []
-            for encoder in (eager, compiled):
+            for encoder in (eager_encoder, compiled_encoder):
                 encoder.zero_grad()
                 features = _packed_test_features(lengths, dtype=torch.float32).transpose(1, 2)
                 out = encoder.forward_sequence_packed(pack_encoder_output(features, lengths))
@@ -698,8 +704,6 @@ class TestPackedConformerEncoder:
         """Check that on CUDA one compiled graph without breaks (the rel_pos Triton kernel, or FlashAttention
         varlen with the rotary embedding fused into the graph) serves batches of other frame counts, utterance
         counts and longest utterances."""
-        from torch._dynamo.utils import counters
-
         torch._dynamo.reset()
         counters.clear()
         torch.manual_seed(5)
@@ -725,6 +729,17 @@ class TestPackedConformerEncoder:
             compiled_out = encoder.forward_sequence_packed(packed).data.float()
             eager_out = reference.forward_sequence_packed(packed).data.float()
         assert (compiled_out - eager_out).norm() <= 1e-2 * eager_out.norm()
+
+    @pytest.mark.unit
+    def test_compiled_layers_refuse_activation_checkpointing(self):
+        """Check that compile_packed_layers raises for layers wrapped in CheckpointWrapper instead of running
+        them uncompiled."""
+        encoder = _packed_encoder(compile_packed_layers=True).double().eval()
+        for index in range(len(encoder.layers)):
+            encoder.layers[index] = checkpoint_wrapper(encoder.layers[index])
+        lengths = torch.tensor([20, 13])
+        with pytest.raises(ValueError, match="activation checkpointing"):
+            encoder.forward_sequence_packed(_packed_test_features(lengths), lengths)
 
     @pytest.mark.unit
     @pytest.mark.timeout(1200)  # two spawned processes that compile the layers in two precisions
@@ -787,8 +802,6 @@ class TestPackedConformerEncoder:
         The wrapped layer's packed forward runs once in the forward and once more in the backward (the recompute),
         and outputs, lengths and gradients equal the unwrapped encoder's.
         """
-        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
-
         torch.manual_seed(5)
         lengths = torch.tensor([20, 13])
         features = _packed_test_features(lengths).requires_grad_()
@@ -1687,8 +1700,6 @@ class TestCacheAwareTraining:
 
     @pytest.mark.unit
     def test_activation_checkpointing_preserves_pad_and_drop(self, cache_aware_model_cfg):
-        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
-
         torch.manual_seed(0)
         encoder = ConformerEncoder.from_config_dict(cache_aware_model_cfg.encoder).cpu().train()
         wrapped = copy.deepcopy(encoder)
@@ -1812,19 +1823,19 @@ def _run_compiled_layers_under_ddp(rank, world_size, init_file, backend, self_at
     dist.init_process_group(backend, init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
         options = dict(device=device, rank=rank, self_attention_model=self_attention_model)
-        reference = _calc_ddp_gradients(compile_packed_layers=False, training_precision=False, **options)
-        scale = max(float(grad.abs().max()) for grad in reference.values())
-        compiled = _calc_ddp_gradients(compile_packed_layers=True, training_precision=False, **options)
-        assert compiled.keys() == reference.keys()
-        for name, grad in reference.items():
+        reference_grads = _calc_ddp_gradients(compile_packed_layers=False, training_precision=False, **options)
+        scale = max(float(grad.abs().max()) for grad in reference_grads.values())
+        compiled_grads = _calc_ddp_gradients(compile_packed_layers=True, training_precision=False, **options)
+        assert compiled_grads.keys() == reference_grads.keys()
+        for name, grad in reference_grads.items():
             # the gradients that are zero in exact arithmetic are rounding noise, hence a floor at the largest one
-            error = float((compiled[name] - grad).norm())
+            error = float((compiled_grads[name] - grad).norm())
             assert error <= 1e-4 * float(grad.norm()) + 1e-6 * scale, (name, error, float(grad.norm()), scale)
-        eager = _calc_ddp_gradients(compile_packed_layers=False, training_precision=True, **options)
-        compiled = _calc_ddp_gradients(compile_packed_layers=True, training_precision=True, **options)
-        for name, grad in reference.items():
-            eager_error = float((eager[name] - grad).norm())
-            error = float((compiled[name] - grad).norm())
+        eager_grads = _calc_ddp_gradients(compile_packed_layers=False, training_precision=True, **options)
+        compiled_grads = _calc_ddp_gradients(compile_packed_layers=True, training_precision=True, **options)
+        for name, grad in reference_grads.items():
+            eager_error = float((eager_grads[name] - grad).norm())
+            error = float((compiled_grads[name] - grad).norm())
             assert error <= 1.5 * eager_error + 2e-4 * scale, (name, error, eager_error, float(grad.norm()), scale)
     finally:
         dist.destroy_process_group()
@@ -1832,9 +1843,6 @@ def _run_compiled_layers_under_ddp(rank, world_size, init_file, backend, self_at
 
 def _calc_ddp_gradients(*, device, rank, self_attention_model, compile_packed_layers, training_precision):
     """Return the parameter gradients of two packed training steps under DDP, averaged over all ranks."""
-    from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
-    from torch.nn.parallel import DistributedDataParallel
-
     torch.manual_seed(0)
     encoder = _packed_encoder(
         self_attention_model=self_attention_model, d_model=128, n_heads=4, compile_packed_layers=compile_packed_layers

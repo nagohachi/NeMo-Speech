@@ -114,7 +114,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             activations, dropout, dtype conversions and residual additions around the matmuls and the attention
             kernel; the values change by floating-point rounding (summation order, intermediates kept in float32)
             and the dropout masks come from Inductor's random number generator.
-            The padded forward is not compiled. Keyword-only; defaults to False.
+            The padded forward is not compiled, and layers wrapped for activation checkpointing are refused.
+            Keyword-only; defaults to False.
         reduction (str, Optional): the method of reduction, choices=['pooling', 'striding']. If no value
             is passed, then no reduction is performed and the models runs with the original 4x subsampling.
         reduction_position (int, Optional): the index of the layer to apply reduction. If -1, apply reduction
@@ -1006,9 +1007,14 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         conv_gap = max(layer.conv.kernel_size for layer in self.layers) - 1
         conv_layout = packed_slot_layout(packed, gap=conv_gap)
 
+        if self.compile_packed_layers and any(isinstance(layer, CheckpointWrapper) for layer in self.layers):
+            raise ValueError(
+                "compile_packed_layers cannot be combined with activation checkpointing: the layers are wrapped in "
+                "CheckpointWrapper, which the compiled packed forward does not run. Disable one of the two."
+            )
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
             original_signal = x
-            if self.compile_packed_layers and not isinstance(layer, CheckpointWrapper):
+            if self.compile_packed_layers:
                 x = compile_forward_packed()(
                     layer, x, attention_context=attention_context, conv_layout=conv_layout, pos_emb=pos_emb
                 )
