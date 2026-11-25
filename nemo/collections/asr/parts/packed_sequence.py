@@ -50,6 +50,11 @@ class PackedEncoderActivations:
         padded_length: Optional dense time dimension associated with the packed
             data. Frontends preserve it solely for dense-compatible augmentation
             RNG ranges; packed kernels continue to use ``max_seqlen``.
+        host_lengths: Optional copy of ``lengths`` on the CPU, shape ``(B,)`` and dtype ``int64``.
+            The stages that need a size derived from the lengths (a token total, a slot count)
+            compute it from this copy instead of reading ``lengths`` back from the device,
+            and the stages that change the lengths (feature framing, subsampling) compute their output copy
+            with the same integer arithmetic as their device lengths. None when no stage knows it.
 
     The representation deliberately has an ASR-specific name rather than reusing
     :class:`torch.nn.utils.rnn.PackedSequence`: the latter stores sort/unsort metadata
@@ -62,6 +67,7 @@ class PackedEncoderActivations:
     max_seqlen: int
     padding_value: float | Tensor = 0.0
     padded_length: int | None = None
+    host_lengths: Tensor | None = None
 
     def __post_init__(self) -> None:
         _validate_packed_encoder_activations(self)
@@ -75,14 +81,18 @@ class PackedEncoderActivations:
         max_seqlen: int,
         padding_value: float | Tensor = 0.0,
         padded_length: int | None = None,
+        host_lengths: Tensor | None = None,
     ) -> "PackedEncoderActivations":
         """Construct without validation from metadata that a validating constructor already checked.
 
         The encoder stages build their outputs with it:
         the validation of the public constructor compares ``cu_seqlens`` with ``lengths`` on the device
         and reads the token count back, host synchronizations the hot path and a CUDA-graph capture cannot afford.
+        A stage that passes ``host_lengths`` vouches that it equals ``lengths``.
         """
-        return _new_packed_encoder_activations(data, lengths, cu_seqlens, max_seqlen, padding_value, padded_length)
+        return _new_packed_encoder_activations(
+            data, lengths, cu_seqlens, max_seqlen, padding_value, padded_length, host_lengths
+        )
 
     @property
     def batch_size(self) -> int:
@@ -113,6 +123,7 @@ class PackedEncoderActivations:
             self.max_seqlen,
             padding_value=self.padding_value,
             padded_length=self.padded_length,
+            host_lengths=self.host_lengths,
         )
 
     def detach(self) -> "PackedEncoderActivations":
@@ -129,6 +140,7 @@ class PackedEncoderActivations:
             self.max_seqlen,
             padding_value=padding_value,
             padded_length=self.padded_length,
+            host_lengths=self.host_lengths,
         )
 
 
@@ -148,12 +160,15 @@ class PackedSlotLayout:
         slot_lengths: slot count of every utterance, shape ``(B,)``.
         total_slots: sum of ``slot_lengths``.
         token_slots: slot index of every packed token, shape ``(T_total,)``.
+        host_slot_lengths: ``slot_lengths`` on the CPU when the packed activations carry ``host_lengths``,
+            else None.
     """
 
     slot_offsets: Tensor
     slot_lengths: Tensor
     total_slots: int
     token_slots: Tensor
+    host_slot_lengths: Tensor | None = None
 
     def scatter(self, data: Tensor) -> Tensor:
         """Place token-flat data ``(T_total, ...)`` into its slots; every other slot is zero."""
@@ -173,6 +188,7 @@ def _packed_encoder_activations_flatten(packed: PackedEncoderActivations):
         packed.max_seqlen,
         packed.padding_value,
         packed.padded_length,
+        packed.host_lengths,
     ]
     return values, None
 
@@ -186,6 +202,7 @@ def _packed_encoder_activations_flatten_with_keys(packed: PackedEncoderActivatio
         "max_seqlen",
         "padding_value",
         "padded_length",
+        "host_lengths",
     )
     keyed_values = [(GetAttrKey(name), value) for name, value in zip(names, values, strict=True)]
     return keyed_values, context
@@ -229,13 +246,16 @@ def pack_encoder_output(padded: Tensor, lengths: Tensor) -> PackedEncoderActivat
 
     if padded.ndim != 3:
         raise ValueError(f"padded must have shape (B, T, D), got {tuple(padded.shape)}.")
-    lengths, max_seqlen = _normalize_lengths(
+    lengths, host_lengths = _normalize_lengths(
         lengths, batch_size=padded.shape[0], max_length=padded.shape[1], device=padded.device
     )
     mask = _length_mask(lengths, padded.shape[1])
     data = padded[mask]
     cu_seqlens = lengths_to_cu_seqlens(lengths)
-    return _new_packed_encoder_activations(data, lengths, cu_seqlens, max_seqlen, padded_length=padded.shape[1])
+    max_seqlen = int(host_lengths.max()) if host_lengths.numel() else 0
+    return _new_packed_encoder_activations(
+        data, lengths, cu_seqlens, max_seqlen, padded_length=padded.shape[1], host_lengths=host_lengths
+    )
 
 
 def unpack_encoder_output(packed: PackedEncoderActivations, *, total_length: int | None = None) -> Tensor:
@@ -256,7 +276,10 @@ def unpack_encoder_output(packed: PackedEncoderActivations, *, total_length: int
     else:
         output = packed.data.new_full((packed.batch_size, total_length, packed.data.shape[-1]), packed.padding_value)
     if packed.total_tokens:
-        output[_length_mask(packed.lengths, total_length)] = packed.data
+        # the row of every token in the flattened (B * T, D) output: an index copy, which needs no device read,
+        # where a boolean mask would count its rows on the host
+        rows = packed_sequence_ids(packed) * total_length + packed_encoder_position_ids(packed)
+        output = output.view(-1, output.shape[-1]).index_copy(0, rows, packed.data).view(output.shape)
     return output
 
 
@@ -301,11 +324,17 @@ def packed_slot_layout(packed: PackedEncoderActivations, *, alignment: int = 1, 
         raise ValueError(f"alignment must be positive, got {alignment}.")
     if gap < 0:
         raise ValueError(f"gap must be non-negative, got {gap}.")
-    slot_lengths = torch.div(packed.lengths + (gap + alignment - 1), alignment, rounding_mode="floor") * alignment
+    slot_lengths = _calc_slot_lengths(packed.lengths, alignment, gap)
     slot_offsets = torch.cumsum(slot_lengths, dim=0) - slot_lengths
-    total_slots = int(slot_lengths.sum().item())
+    host_slot_lengths = None
+    if packed.host_lengths is not None:
+        # the same arithmetic on the host copy gives the total without a device read
+        host_slot_lengths = _calc_slot_lengths(packed.host_lengths, alignment, gap)
+        total_slots = int(host_slot_lengths.sum())
+    else:
+        total_slots = int(slot_lengths.sum().item())
     token_slots = slot_offsets[packed_sequence_ids(packed)] + packed_encoder_position_ids(packed)
-    return PackedSlotLayout(slot_offsets, slot_lengths, total_slots, token_slots)
+    return PackedSlotLayout(slot_offsets, slot_lengths, total_slots, token_slots, host_slot_lengths)
 
 
 def split_packed_data(data: Tensor, lengths: Tensor, cu_seqlens: Tensor) -> tuple[Tensor, ...]:
@@ -366,12 +395,12 @@ def _normalize_lengths(lengths: Tensor, *, batch_size: int, max_length: int, dev
         raise TypeError(f"lengths must have an integer dtype, got {lengths.dtype}.")
     lengths = lengths.to(torch.int64)
     # Varlen kernels need a host max length. Validate the same host copy so the
-    # hot packing path pays one device synchronization rather than one per check.
+    # hot packing path pays one device synchronization rather than one per check;
+    # the packed activations carry it on for the later stages.
     host_lengths = lengths.detach().to(device="cpu")
     if bool(((host_lengths < 0) | (host_lengths > max_length)).any()):
         raise ValueError(f"lengths must be between 0 and padded time {max_length}, got {host_lengths.tolist()}.")
-    max_seqlen = int(host_lengths.max()) if host_lengths.numel() else 0
-    return lengths, max_seqlen
+    return lengths, host_lengths
 
 
 def _validate_packed_encoder_activations(packed: PackedEncoderActivations) -> None:
@@ -413,9 +442,20 @@ def _validate_packed_encoder_activations(packed: PackedEncoderActivations) -> No
         raise ValueError(
             f"padded_length must be an integer >= max_seqlen ({packed.max_seqlen}), got {packed.padded_length}."
         )
+    if packed.host_lengths is not None:
+        host_lengths = packed.host_lengths
+        if host_lengths.device.type != "cpu" or host_lengths.ndim != 1 or host_lengths.dtype != torch.int64:
+            raise ValueError(
+                "host_lengths must be a 1D int64 CPU tensor, got "
+                f"shape={tuple(host_lengths.shape)}, {host_lengths.dtype} on {host_lengths.device}."
+            )
+        if not torch.equal(host_lengths, packed.lengths.cpu()):
+            raise ValueError("host_lengths must equal lengths.")
 
 
-def _new_packed_encoder_activations(data, lengths, cu_seqlens, max_seqlen, padding_value=0.0, padded_length=None):
+def _new_packed_encoder_activations(
+    data, lengths, cu_seqlens, max_seqlen, padding_value=0.0, padded_length=None, host_lengths=None
+):
     """Construct from metadata that a public constructor already validated."""
     packed = object.__new__(PackedEncoderActivations)
     object.__setattr__(packed, "data", data)
@@ -424,4 +464,10 @@ def _new_packed_encoder_activations(data, lengths, cu_seqlens, max_seqlen, paddi
     object.__setattr__(packed, "max_seqlen", max_seqlen)
     object.__setattr__(packed, "padding_value", padding_value)
     object.__setattr__(packed, "padded_length", padded_length)
+    object.__setattr__(packed, "host_lengths", host_lengths)
     return packed
+
+
+def _calc_slot_lengths(lengths: Tensor, alignment: int, gap: int) -> Tensor:
+    """Return the slots of every utterance in ``packed_slot_layout``: ``ceil((L + gap) / alignment) * alignment``."""
+    return torch.div(lengths + (gap + alignment - 1), alignment, rounding_mode="floor") * alignment

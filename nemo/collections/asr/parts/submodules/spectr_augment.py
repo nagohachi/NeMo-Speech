@@ -411,7 +411,9 @@ def _apply_packed_range_masks(
 ):
     if packed.total_tokens == 0:
         return data
-    sequence_ids = torch.repeat_interleave(torch.arange(packed.batch_size, device=data.device), packed.lengths)
+    sequence_ids = torch.repeat_interleave(
+        torch.arange(packed.batch_size, device=data.device), packed.lengths, output_size=packed.total_tokens
+    )
     positions = packed_encoder_position_ids(packed)
     bins = torch.arange(data.shape[1], device=data.device)
     time_mask = (positions[:, None] >= time_start[sequence_ids]) & (

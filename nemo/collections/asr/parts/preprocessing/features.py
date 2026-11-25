@@ -119,7 +119,9 @@ def normalize_packed_batch(packed: PackedEncoderActivations, normalize_type) -> 
     """Normalize token-flat features independently within each sequence."""
     if not normalize_type or packed.total_tokens == 0:
         return packed
-    sequence_ids = torch.repeat_interleave(torch.arange(packed.batch_size, device=packed.data.device), packed.lengths)
+    sequence_ids = torch.repeat_interleave(
+        torch.arange(packed.batch_size, device=packed.data.device), packed.lengths, output_size=packed.total_tokens
+    )
     data, padding_value = _normalize_packed_features_and_padding(
         packed.data,
         packed.lengths,
@@ -134,6 +136,7 @@ def normalize_packed_batch(packed: PackedEncoderActivations, normalize_type) -> 
         packed.max_seqlen,
         padding_value,
         padded_length=packed.padded_length,
+        host_lengths=packed.host_lengths,
     )
 
 
@@ -504,7 +507,9 @@ class FilterbankFeatures(nn.Module):
     def filter_banks(self):
         return self.fb
 
-    def forward_packed(self, x, seq_len, cu_seqlens, linear_spec=False) -> PackedEncoderActivations:
+    def forward_packed(
+        self, x, seq_len, cu_seqlens, linear_spec=False, *, host_seq_len=None
+    ) -> PackedEncoderActivations:
         """Compute features from concatenated waveforms with one vectorized STFT.
 
         Each utterance is placed in a hop-aligned block with the same zero guard
@@ -514,8 +519,14 @@ class FilterbankFeatures(nn.Module):
 
         ``pad_to`` is intentionally ignored: it is a dense-layout optimization and
         packed output contains exactly ``sum(output_lengths)`` frames.
+
+        The sizes of the computation (the guarded signal, the frame count, the longest utterance)
+        come from a host copy of ``seq_len``: ``host_seq_len`` (a CPU tensor or a sequence of ints) when the caller
+        has one, which it vouches equals ``seq_len`` with ``cu_seqlens`` its prefix sum, so that no device read
+        is needed; otherwise one device read that also validates ``seq_len`` against ``cu_seqlens``.
+        The output carries the host copy of its frame counts (``PackedEncoderActivations.host_lengths``).
         """
-        seq_len, cu_seqlens, host_seq_len = _validate_packed_waveforms(x, seq_len, cu_seqlens)
+        seq_len, cu_seqlens, host_seq_len = _validate_packed_waveforms(x, seq_len, cu_seqlens, host_seq_len)
         feature_lengths = torch.where(seq_len == 0, 0, self.get_seq_len(seq_len))
         host_feature_lengths = torch.where(host_seq_len == 0, 0, self.get_seq_len(host_seq_len))
         padded_length = _dense_feature_width(
@@ -537,6 +548,7 @@ class FilterbankFeatures(nn.Module):
                 padding_value=self.pad_value,
                 padded_length=padded_length,
                 max_seqlen=max_seqlen,
+                host_lengths=host_feature_lengths,
             )
 
         pad_left, pad_right = self._signal_padding()
@@ -552,7 +564,7 @@ class FilterbankFeatures(nn.Module):
 
         if self.stft_pad_amount is None:
             samples = _dither_and_preemphasize_packed(
-                x, seq_len, cu_seqlens, self.preemph, self.dither if self.training else 0.0
+                x, cu_seqlens, self.preemph, self.dither if self.training else 0.0
             )
             guarded[guarded_positions] = samples
         else:
@@ -600,6 +612,7 @@ class FilterbankFeatures(nn.Module):
                 padding_value=self.pad_value,
                 padded_length=padded_length,
                 max_seqlen=max_seqlen,
+                host_lengths=host_feature_lengths,
             )
 
         with torch.amp.autocast(x.device.type, enabled=False):
@@ -625,6 +638,7 @@ class FilterbankFeatures(nn.Module):
             padding_value=self.pad_value,
             padded_length=padded_length,
             max_seqlen=max_seqlen,
+            host_lengths=host_feature_lengths,
         )
 
     def forward(self, x, seq_len, linear_spec=False):
@@ -720,7 +734,7 @@ class FilterbankFeatures(nn.Module):
         return x, seq_len
 
 
-def _validate_packed_waveforms(x, seq_len, cu_seqlens):
+def _validate_packed_waveforms(x, seq_len, cu_seqlens, host_seq_len=None):
     if x.ndim != 1:
         raise ValueError(f"packed waveform data must be 1D, got shape {tuple(x.shape)}.")
     if seq_len.ndim != 1:
@@ -735,6 +749,21 @@ def _validate_packed_waveforms(x, seq_len, cu_seqlens):
         raise ValueError("packed waveform data, length, and cu_seqlens must be on the same device.")
     seq_len = seq_len.to(torch.int64)
     cu_seqlens = cu_seqlens.to(torch.int64)
+    if host_seq_len is not None:
+        # the caller's host copy, checked on the host; that it matches the device metadata is the caller's contract
+        host_seq_len = torch.as_tensor(host_seq_len, dtype=torch.int64)
+        if host_seq_len.device.type != "cpu" or host_seq_len.shape != seq_len.shape:
+            raise ValueError(
+                f"host_seq_len must be a CPU copy of length, shape {tuple(seq_len.shape)}, "
+                f"got shape {tuple(host_seq_len.shape)} on {host_seq_len.device}."
+            )
+        if bool((host_seq_len < 0).any()):
+            raise ValueError("length must be non-negative.")
+        if int(host_seq_len.sum()) != x.shape[0]:
+            raise ValueError(
+                f"packed waveform data has {x.shape[0]} samples, but host_seq_len sums to {int(host_seq_len.sum())}."
+            )
+        return seq_len, cu_seqlens, host_seq_len
     host_metadata = torch.cat((seq_len, cu_seqlens)).detach().cpu()
     host_seq_len = host_metadata[: seq_len.numel()]
     host_cu_seqlens = host_metadata[seq_len.numel() :]
@@ -765,13 +794,17 @@ def _dense_feature_width(lengths, pad_to, max_length, extra_frame: bool = True):
     return width
 
 
-def _dither_and_preemphasize_packed(x, lengths, cu_seqlens, preemph, dither):
+def _dither_and_preemphasize_packed(x, cu_seqlens, preemph, dither):
     samples = x + dither * torch.randn_like(x) if dither > 0 else x
     if preemph is None or samples.numel() == 0:
         return samples
     emphasized = torch.cat([samples[:1], samples[1:] - preemph * samples[:-1]])
-    starts = cu_seqlens[:-1][lengths > 0]
-    return emphasized.scatter(0, starts, samples.index_select(0, starts))
+    # the first sample of every utterance keeps its value; the offset of an empty utterance is the first sample
+    # of the next one, or the end of the data, so marking every offset needs no device read to drop the empty ones
+    # (index_fill_ takes the value as a kernel argument: an assignment would copy it to the device and wait for it)
+    is_start = torch.zeros(samples.numel() + 1, dtype=torch.bool, device=samples.device)
+    is_start.index_fill_(0, cu_seqlens[:-1], True)
+    return torch.where(is_start[:-1], samples, emphasized)
 
 
 def _dither_and_preemphasize_exact_pad_blocks(guarded, lengths, block_lengths, block_offsets, preemph, dither):
@@ -781,7 +814,10 @@ def _dither_and_preemphasize_exact_pad_blocks(guarded, lengths, block_lengths, b
         emphasized = torch.cat([guarded[:1], guarded[1:] - preemph * guarded[:-1]])
         starts = block_offsets[:-1]
         guarded = emphasized.scatter(0, starts, guarded.index_select(0, starts))
-        block_ids = torch.repeat_interleave(torch.arange(lengths.numel(), device=guarded.device), block_lengths)
+        # the blocks tile the guarded signal, so its size is the output size: no device read
+        block_ids = torch.repeat_interleave(
+            torch.arange(lengths.numel(), device=guarded.device), block_lengths, output_size=guarded.numel()
+        )
         local_samples = torch.arange(guarded.numel(), device=guarded.device) - block_offsets[block_ids]
         guarded = guarded.masked_fill(local_samples >= lengths[block_ids], 0.0)
     return guarded
@@ -868,20 +904,25 @@ def _expand_packed_padding(padding_value, features, lengths):
     return features.new_full((lengths.numel(), features.shape[1]), padding_value)
 
 
-def _make_packed_features(features, lengths, *, padding_value=0.0, padded_length=None, max_seqlen=None):
+def _make_packed_features(
+    features, lengths, *, padding_value=0.0, padded_length=None, max_seqlen=None, host_lengths=None
+):
     cu_seqlens = torch.cat([lengths.new_zeros(1, dtype=torch.int32), lengths.cumsum(0, dtype=torch.int32)])
     if max_seqlen is None:
         max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
     return _new_packed_encoder_activations(
-        features, lengths.to(torch.int64), cu_seqlens, max_seqlen, padding_value, padded_length
+        features, lengths.to(torch.int64), cu_seqlens, max_seqlen, padding_value, padded_length, host_lengths
     )
 
 
-def _empty_packed_features(x, lengths, feature_dim, *, padding_value=0.0, padded_length=None, max_seqlen=None):
+def _empty_packed_features(
+    x, lengths, feature_dim, *, padding_value=0.0, padded_length=None, max_seqlen=None, host_lengths=None
+):
     return _make_packed_features(
         x.new_empty((0, feature_dim)),
         lengths,
         padding_value=padding_value,
         padded_length=padded_length,
         max_seqlen=max_seqlen,
+        host_lengths=host_lengths,
     )

@@ -20,7 +20,11 @@ import torch
 import torch._dynamo
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from nemo.collections.asr.parts.packed_sequence import pack_encoder_output, packed_sequence_ids
+from nemo.collections.asr.parts.packed_sequence import (
+    PackedEncoderActivations,
+    pack_encoder_output,
+    packed_sequence_ids,
+)
 from nemo.collections.asr.parts.submodules import packed_attention as packed_attention_module
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     RelPositionalEncoding,
@@ -195,6 +199,17 @@ def _dense_window_attention(q, k, v, lengths, key_window, rel_pos_bias=None):
             outputs.append(torch.einsum("hj,jhd->hd", torch.softmax(scores, dim=-1), v[keys]))
         offset += length
     return torch.stack(outputs)
+
+
+@pytest.mark.unit
+def test_sequence_slices_from_host_lengths():
+    """Check that the reference path slices the utterances from the host lengths when the activations carry them."""
+    packed = pack_encoder_output(torch.randn(3, 5, 2), torch.tensor([5, 0, 3]))
+    without = PackedEncoderActivations.from_validated(
+        packed.data, packed.lengths, packed.cu_seqlens, packed.max_seqlen
+    )
+    assert PackedAttentionContext(packed).sequence_slices == ((0, 5), (5, 5), (5, 8))
+    assert PackedAttentionContext(without).sequence_slices == ((0, 5), (5, 5), (5, 8))
 
 
 class TestPackedAttentionKeyWindow:

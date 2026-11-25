@@ -31,6 +31,7 @@ from nemo.collections.asr.modules.transformer_encoder import (
 )
 from nemo.collections.asr.parts.packed_sequence import (
     PackedEncoderActivations,
+    lengths_to_cu_seqlens,
     pack_encoder_output,
     packed_encoder_position_ids,
     packed_sequence_ids,
@@ -158,12 +159,14 @@ def test_packed_encoder_output_pytree_transforms_do_not_revalidate_temporary_lea
     assert restored.max_seqlen == packed.max_seqlen
     assert restored.padding_value == packed.padding_value
     assert restored.padded_length == packed.padded_length
+    assert restored.host_lengths is packed.host_lengths
     assert placeholder.data is None
     assert placeholder.lengths is None
     assert placeholder.cu_seqlens is None
     assert placeholder.max_seqlen is None
     assert placeholder.padding_value is None
     assert placeholder.padded_length is None
+    assert placeholder.host_lengths is None
 
 
 def _make_encoder(*, position: str, attention: str = "full", qk_norm: bool = False, rotary_fraction: float = 1.0):
@@ -717,6 +720,69 @@ def test_packed_slot_layout_slots_and_round_trip():
     assert packed_sequence_ids(packed).tolist() == [0, 0, 0, 0, 0, 1, 1]
     with pytest.raises(ValueError, match="alignment"):
         packed_slot_layout(packed, alignment=0)
+
+
+def test_packed_encoder_activations_carry_host_lengths():
+    """Check that pack_encoder_output keeps the host copy of the lengths it validated, and the metadata-preserving
+    methods keep it."""
+    packed = pack_encoder_output(torch.randn(2, 4, 3), torch.tensor([4, 2]))
+
+    assert packed.host_lengths.device.type == "cpu" and torch.equal(packed.host_lengths, packed.lengths)
+    assert packed.with_data(torch.randn(6, 5)).host_lengths is packed.host_lengths
+    assert packed.detach().host_lengths is packed.host_lengths
+    assert packed.cpu().host_lengths is packed.host_lengths
+    leaves, _ = torch.utils._pytree.tree_flatten(packed)
+    assert any(leaf is packed.host_lengths for leaf in leaves)
+
+
+def test_public_constructor_validates_host_lengths():
+    data, lengths = torch.randn(6, 3), torch.tensor([4, 2])
+    cu_seqlens = lengths_to_cu_seqlens(lengths)
+
+    packed = PackedEncoderActivations(data, lengths, cu_seqlens, 4, host_lengths=lengths.clone())
+    assert torch.equal(packed.host_lengths, lengths)
+    with pytest.raises(ValueError, match="host_lengths must equal lengths"):
+        PackedEncoderActivations(data, lengths, cu_seqlens, 4, host_lengths=torch.tensor([3, 3]))
+    with pytest.raises(ValueError, match="1D int64 CPU tensor"):
+        PackedEncoderActivations(data, lengths, cu_seqlens, 4, host_lengths=lengths.to(torch.int32))
+
+
+@pytest.mark.parametrize("alignment, gap", [(1, 0), (4, 2), (8, 8)])
+def test_packed_slot_layout_sizes_from_host_lengths(alignment, gap):
+    """Check that host lengths give the slot layout of the device lengths without a device read."""
+    packed = pack_encoder_output(torch.randn(3, 7, 2), torch.tensor([7, 0, 3]))
+    without = PackedEncoderActivations.from_validated(
+        packed.data, packed.lengths, packed.cu_seqlens, packed.max_seqlen
+    )
+
+    expected = packed_slot_layout(without, alignment=alignment, gap=gap)
+    actual = packed_slot_layout(packed, alignment=alignment, gap=gap)
+
+    assert expected.host_slot_lengths is None
+    assert actual.total_slots == expected.total_slots
+    assert torch.equal(actual.host_slot_lengths, expected.slot_lengths)
+    for name in ("slot_offsets", "slot_lengths", "token_slots"):
+        assert torch.equal(getattr(actual, name), getattr(expected, name)), name
+
+
+def test_unpack_encoder_output_values_and_gradient():
+    """Check that valid frames land at their rows, the padding takes the padding value and the gradient flows back."""
+    padded = torch.randn(3, 5, 2)
+    lengths = torch.tensor([5, 0, 2])
+    packed = pack_encoder_output(padded, lengths)
+    data = packed.data.clone().requires_grad_()
+    mask = torch.arange(6)[None, :] < lengths[:, None]
+
+    output = unpack_encoder_output(
+        PackedEncoderActivations(data, packed.lengths, packed.cu_seqlens, 5, padding_value=-1.0), total_length=6
+    )
+
+    expected = torch.full((3, 6, 2), -1.0)
+    expected[:, :5][mask[:, :5]] = padded[mask[:, :5]]
+    assert torch.equal(output, expected)
+    weights = torch.randn(3, 6, 2)
+    (output * weights).sum().backward()
+    assert torch.equal(data.grad, weights[mask])
 
 
 def test_packed_encoder_output_detach_and_cpu_keep_metadata():

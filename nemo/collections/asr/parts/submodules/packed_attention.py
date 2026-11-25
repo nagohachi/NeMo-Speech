@@ -16,6 +16,7 @@
 """Self- and cross-attention over sequence-packed activations with explicit per-sequence boundaries."""
 
 import functools
+import itertools
 import math
 from collections.abc import Callable
 
@@ -104,6 +105,7 @@ class PackedAttentionContext:
         rel_pos_kernel: bool = True,
     ):
         self.lengths = packed.lengths
+        self.host_lengths = packed.host_lengths
         self.cu_seqlens = packed.cu_seqlens
         self.max_seqlen = packed.max_seqlen
         self.total_tokens = packed.total_tokens
@@ -143,11 +145,25 @@ class PackedAttentionContext:
         self._key_spans = None
 
     @classmethod
-    def from_lengths(cls, lengths: Tensor, *, rel_pos_kernel: bool = True) -> "PackedAttentionContext":
-        """Metadata for token-flat ids or states whose sequences have these lengths, in packing order."""
+    def from_lengths(
+        cls,
+        lengths: Tensor,
+        *,
+        rel_pos_kernel: bool = True,
+        total_tokens: int | None = None,
+        max_seqlen: int | None = None,
+    ) -> "PackedAttentionContext":
+        """Metadata for token-flat ids or states whose sequences have these lengths, in packing order.
+
+        ``total_tokens`` and ``max_seqlen``, the sum and the maximum of ``lengths``, are read from the device
+        unless the caller passes them (for example from the shape of the token-flat data and a host copy
+        of the lengths), which saves the device synchronizations of the reads.
+        """
         lengths = lengths.to(torch.int64)
-        total_tokens = int(lengths.sum().item())
-        max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
+        if total_tokens is None:
+            total_tokens = int(lengths.sum().item())
+        if max_seqlen is None:
+            max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
         placeholder = lengths.new_empty((total_tokens, 0), dtype=torch.float32)
         packed = PackedEncoderActivations.from_validated(
             placeholder, lengths, lengths_to_cu_seqlens(lengths), max_seqlen
@@ -158,7 +174,10 @@ class PackedAttentionContext:
     def sequence_slices(self) -> tuple[tuple[int, int], ...]:
         """Host copies of the utterance boundaries, for the per-utterance reference path."""
         if self._sequence_slices is None:
-            offsets = self.cu_seqlens.tolist()
+            if self.host_lengths is not None:
+                offsets = [0, *itertools.accumulate(self.host_lengths.tolist())]
+            else:
+                offsets = self.cu_seqlens.tolist()
             self._sequence_slices = tuple(zip(offsets[:-1], offsets[1:]))
         return self._sequence_slices
 

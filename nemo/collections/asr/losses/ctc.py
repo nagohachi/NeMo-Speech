@@ -70,7 +70,14 @@ class CTCLoss(nn.CTCLoss, Serialization, Typing):
 
         return losses
 
-    def forward_packed(self, log_probs: PackedEncoderActivations, targets: Tensor, target_lengths: Tensor) -> Tensor:
+    def forward_packed(
+        self,
+        log_probs: PackedEncoderActivations,
+        targets: Tensor,
+        target_lengths: Tensor,
+        *,
+        check_lengths: bool = True,
+    ) -> Tensor:
         """Compute the CTC loss from token-flat log probabilities with explicit sequence boundaries.
 
         On CUDA, for float32, bfloat16 and float16 log probabilities,
@@ -87,6 +94,9 @@ class CTCLoss(nn.CTCLoss, Serialization, Typing):
             log_probs: concatenated per-utterance log probabilities, shape ``(sum(T_i), D)`` including the blank.
             targets: padded target ids, shape ``(B, U)``.
             target_lengths: number of target ids per utterance, shape ``(B,)``.
+            check_lengths: whether the kernel reads ``target_lengths`` from the device to check them against
+                the width of ``targets``; False when the caller guarantees ``0 <= target_lengths <= U``
+                (see ``packed_ctc_loss``). The padded fallback ignores it.
 
         Returns:
             The loss as ``forward`` returns it for the configured reduction.
@@ -109,6 +119,7 @@ class CTCLoss(nn.CTCLoss, Serialization, Typing):
                 target_lengths,
                 blank=self._blank,
                 zero_infinity=self.zero_infinity,
+                check_lengths=check_lengths,
             )
             if self.reduction == 'sum':
                 loss = losses.sum()
