@@ -32,6 +32,10 @@ from nemo.collections.asr.parts.submodules.packed_attention import PackedAttenti
 from nemo.collections.asr.parts.utils.activations import Swish
 from nemo.collections.common.parts.utils import ModuleBlock, activation_registry, block_binds, build_module
 from nemo.core.classes.mixins import AccessMixin
+from nemo.core.utils.optional_libs import TRITON_AVAILABLE
+
+if TRITON_AVAILABLE:
+    from nemo.collections.asr.parts.triton.packed_depthwise_conv import run_packed_depthwise_conv1d
 
 __all__ = ['ConformerConvolution', 'ConformerFeedForward', 'ConformerLayer', 'build_self_attention']
 
@@ -544,6 +548,10 @@ class ConformerConvolution(nn.Module):
             for parameter in self.depthwise_conv.parameters():
                 anchor = anchor + parameter.sum().to(anchor.dtype) * 0.0
             x = x + anchor
+        elif _runs_packed_depthwise_kernel(self.depthwise_conv, x):
+            # the same convolution on the frame rows: a tap that leaves its utterance reads zero
+            conv = self.depthwise_conv
+            x = run_packed_depthwise_conv1d(x, conv.weight, conv.bias, layout.token_slots, conv._left_padding)
         else:
             # one channel-first sequence over the gapped slots; the empty slots are the zero padding between utterances
             slots = layout.scatter(x).transpose(0, 1).unsqueeze(0)
@@ -637,3 +645,22 @@ class ConformerFeedForward(nn.Module):
             if self.use_bias:
                 nn.init.uniform_(self.linear1.bias, -ffn1_max, ffn1_max)
                 nn.init.uniform_(self.linear2.bias, -ffn2_max, ffn2_max)
+
+
+def _runs_packed_depthwise_kernel(conv: nn.Module, x: torch.Tensor) -> bool:
+    """Check whether ``ConformerConvolution.forward_packed`` runs ``conv`` with the Triton kernel of packed rows.
+
+    The kernel covers the depthwise convolution the module builds (``CausalConv1D``, stride 1, no dilation,
+    zero padding) on CUDA when Triton is installed; other cases take the gapped-slot form.
+    """
+    return (
+        TRITON_AVAILABLE
+        and x.is_cuda
+        and isinstance(conv, CausalConv1D)
+        and conv.groups == conv.in_channels == conv.out_channels
+        and conv.stride == (1,)
+        and conv.dilation == (1,)
+        and conv.padding == (0,)
+        and conv.padding_mode == 'zeros'
+        and conv._left_padding + conv._right_padding == conv.kernel_size[0] - 1
+    )
