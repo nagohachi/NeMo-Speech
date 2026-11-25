@@ -82,19 +82,52 @@ def test_ctc_target_lengths_exclude_end_of_text(asr_model_ctc, cuts):
 
 
 @pytest.mark.unit
-def test_padded_training_step_adds_the_ctc_loss(asr_model_ctc, cuts):
-    """Check that the padded step trains on (1 - w) * attention loss + w * CTC loss: the CTC head gets gradients,
-    and without the weight the loss is the attention loss alone."""
+def test_padded_training_step_mixes_attention_and_ctc_losses(asr_model_ctc, cuts):
+    """Check that the padded step trains on 0.7 * attention loss + 0.3 * CTC loss, the CTC loss computed here
+    from the encoder output, and that the CTC head gets gradients."""
     asr_model_ctc.eval()
     batch = _make_padded_dataset(asr_model_ctc)[cuts]
     loss = asr_model_ctc.training_step(batch, batch_nb=0)["loss"]
     loss.backward()
-    assert torch.isfinite(loss)
     assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in asr_model_ctc.ctc_decoder.parameters())
     with torch.no_grad():
+        input_ids, _ = batch.get_decoder_inputs_outputs()
+        _, encoded_len, _, _, encoded = asr_model_ctc._forward(
+            input_signal=batch.audio,
+            input_signal_length=batch.audio_lens,
+            transcript=input_ids,
+            transcript_length=batch.prompted_transcript_lens - 1,
+        )
+        ctc_loss = asr_model_ctc.ctc_loss(
+            log_probs=asr_model_ctc.ctc_decoder(encoder_output=encoded),
+            targets=batch.transcript,
+            input_lengths=encoded_len,
+            target_lengths=batch.transcript_lens,  # the answers end without the end-of-text token
+        )
         asr_model_ctc.ctc_loss_weight = 0.0
-        attention_only = asr_model_ctc.training_step(batch, batch_nb=0)["loss"]
-    assert not torch.allclose(loss.detach(), attention_only)
+        attention_loss = asr_model_ctc.training_step(batch, batch_nb=0)["loss"]
+    assert torch.isfinite(ctc_loss) and ctc_loss > 0
+    torch.testing.assert_close(loss.detach(), 0.7 * attention_loss + 0.3 * ctc_loss)
+
+
+@pytest.mark.unit
+def test_ctc_loss_of_a_transcript_too_long_for_its_frames_is_infinite_unless_opted_out(asr_model):
+    """Check that zero_infinity is off by default, so such an utterance is not dropped from the CTC term silently,
+    and that zero_infinity: true zeroes its loss."""
+    targets = torch.tensor([[1, 2, 3]])  # three tokens
+    for aux_ctc, expected_finite in (
+        ({"ctc_loss_weight": 0.3}, False),
+        ({"ctc_loss_weight": 0.3, "zero_infinity": True}, True),
+    ):
+        cfg = asr_model.cfg.copy()
+        with open_dict(cfg):
+            cfg.aux_ctc = aux_ctc
+        model = EncDecMultiTaskModel(cfg=cfg)
+        log_probs = torch.randn(1, 2, model.ctc_decoder.num_classes_with_blank).log_softmax(-1)  # two frames
+        loss = model.ctc_loss(
+            log_probs=log_probs, targets=targets, input_lengths=torch.tensor([2]), target_lengths=torch.tensor([3])
+        )
+        assert bool(torch.isfinite(loss)) == expected_finite
 
 
 @pytest.mark.unit
@@ -113,16 +146,32 @@ def test_change_vocabulary_rebuilds_the_ctc_head(asr_model_ctc):
 
 
 @pytest.mark.unit
-def test_aux_ctc_reduction_defaults_to_per_token(asr_model_ctc):
-    assert asr_model_ctc.ctc_loss.config_reduction == "mean_volume"
-
-
-@pytest.mark.unit
 def test_aux_ctc_refuses_keys_it_does_not_read(asr_model):
     cfg = asr_model.cfg.copy()
     with open_dict(cfg):
         cfg.aux_ctc = {"ctc_loss_weight": 0.3, "decoder": {"feat_in": 128}}
     with pytest.raises(ValueError, match="decoder"):
+        EncDecMultiTaskModel(cfg=cfg)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "aux_ctc,message",
+    [
+        ({"ctc_loss_weight": -0.1}, "between 0 and 1"),
+        ({"ctc_loss_weight": 1.5}, "between 0 and 1"),
+        ({"ctc_loss_weight": None}, "between 0 and 1"),
+        ({"ctc_reduction": "mean_batch"}, "apply only with ctc_loss_weight > 0"),
+        ({"ctc_loss_weight": 0.0, "zero_infinity": True}, "apply only with ctc_loss_weight > 0"),
+        ({"ctc_loss_weight": 0.3, "ctc_reduction": "none"}, "ctc_reduction must be one of"),
+        ({"ctc_loss_weight": 0.3, "zero_infinity": "yes"}, "zero_infinity must be a bool"),
+    ],
+)
+def test_aux_ctc_rejects_values_it_cannot_apply(asr_model, aux_ctc, message):
+    cfg = asr_model.cfg.copy()
+    with open_dict(cfg):
+        cfg.aux_ctc = aux_ctc
+    with pytest.raises(ValueError, match=message):
         EncDecMultiTaskModel(cfg=cfg)
 
 

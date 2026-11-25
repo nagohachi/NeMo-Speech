@@ -43,6 +43,7 @@ model:
   # aux_ctc:
   #   ctc_loss_weight: 0.3
   #   ctc_reduction: mean_volume
+  #   zero_infinity: false # true: train utterances whose transcript is too long for CTC on the attention loss alone
 
   # Important ! Set the prompt format to the class you need
   prompt_format: ???   # Options supported: ["canary", "canary2"]

@@ -144,6 +144,8 @@ The auxiliary CTC loss of ``EncDecMultiTaskModel`` (``model.aux_ctc``) adds a ``
 ``(1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss``.
 ``ctc_reduction`` defaults to ``mean_volume``, the CTC loss divided by the number of target tokens, a per-token loss like the attention cross-entropy.
 The CTC targets are the transcript tokens without the prompt and without a final end-of-text token.
+``ctc_loss_weight`` must be between 0 and 1.
+A transcript with more tokens than its utterance has encoder frames makes the CTC loss infinite; ``zero_infinity: true`` sets the loss of such an utterance and its gradients to zero instead, so that it trains on the attention loss alone.
 
 
 .. _rnn-encoder-api:

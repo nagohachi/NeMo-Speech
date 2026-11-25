@@ -233,11 +233,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         # the training loss becomes (1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss.
         # The CTC targets are the transcript tokens without the prompt and the end-of-text token.
         aux_ctc = self.cfg.get("aux_ctc") or {}
-        if unsupported := set(aux_ctc) - {"ctc_loss_weight", "ctc_reduction"}:
-            raise ValueError(
-                f"aux_ctc has keys that EncDecMultiTaskModel does not read: {sorted(unsupported)}. "
-                "Its CTC head is a ConvASRDecoder on the encoder output; set only ctc_loss_weight and ctc_reduction."
-            )
+        _check_aux_ctc_config(aux_ctc)
         self.ctc_loss_weight = float(aux_ctc.get("ctc_loss_weight", 0.0))
         if self.ctc_loss_weight > 0:
             self._setup_aux_ctc(vocab_size)
@@ -457,11 +453,13 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         ``ctc_reduction`` defaults to ``mean_volume``, the summed CTC losses divided by the number of target tokens,
         a per-token loss like the attention cross-entropy, so that ``ctc_loss_weight`` weighs two comparable terms.
+        ``zero_infinity`` defaults to False: a transcript too long for its encoder frames makes the loss infinite
+        instead of leaving the CTC term without a word.
         """
         self.ctc_decoder = ConvASRDecoder(feat_in=self.cfg.model_defaults.asr_enc_hidden, num_classes=vocab_size)
         self.ctc_loss = CTCLoss(
             num_classes=vocab_size,
-            zero_infinity=True,
+            zero_infinity=self.cfg.aux_ctc.get("zero_infinity", False),
             reduction=self.cfg.aux_ctc.get("ctc_reduction", "mean_volume"),
         )
 
@@ -1535,3 +1533,24 @@ def parse_multitask_prompt(prompt: dict | None) -> list[dict]:
     # )
     role = prompt.pop("role", "user")
     return [dict(role=role, slots=prompt)]
+
+
+def _check_aux_ctc_config(aux_ctc) -> None:
+    """Raise ``ValueError`` for an ``aux_ctc`` config that ``EncDecMultiTaskModel`` cannot apply as written."""
+    if unsupported := set(aux_ctc) - {"ctc_loss_weight", "ctc_reduction", "zero_infinity"}:
+        raise ValueError(
+            f"aux_ctc has keys that EncDecMultiTaskModel does not read: {sorted(unsupported)}. Its CTC head is a "
+            "ConvASRDecoder on the encoder output; set only ctc_loss_weight, ctc_reduction and zero_infinity."
+        )
+    weight = aux_ctc.get("ctc_loss_weight", 0.0)
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 <= weight <= 1:
+        raise ValueError(f"aux_ctc.ctc_loss_weight must be a number between 0 and 1, got {weight!r}.")
+    if weight == 0 and (unused := set(aux_ctc) & {"ctc_reduction", "zero_infinity"}):
+        raise ValueError(f"aux_ctc sets {sorted(unused)}, which apply only with ctc_loss_weight > 0.")
+    reduction = aux_ctc.get("ctc_reduction", "mean_volume")
+    if reduction not in ("mean_volume", "mean_batch", "mean", "sum"):
+        raise ValueError(
+            f"aux_ctc.ctc_reduction must be one of mean_volume, mean_batch, mean or sum, got {reduction!r}."
+        )
+    if not isinstance(aux_ctc.get("zero_infinity", False), bool):
+        raise ValueError(f"aux_ctc.zero_infinity must be a bool, got {aux_ctc.get('zero_infinity')!r}.")
