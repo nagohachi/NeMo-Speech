@@ -131,23 +131,24 @@ def test_packed_training_step_backward(deterministic_rng, asr_model, cuts):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("pack_sequences", [False, True])
-def test_batch_cuts_drop_token_ids(asr_model, cuts, pack_sequences):
-    """Check that the batch drops the token tensors of pretokenized cuts (it collates them); the sampler keeps them."""
+def test_packed_batch_cuts_drop_token_ids(asr_model, cuts):
+    """Check that the packed batch drops the token tensors of pretokenized cuts (it collates them),
+    the sampler keeps them, and the padded batch leaves its cuts as they were."""
     prompt = CanaryPromptFormatter(asr_model.tokenizer)
     for cut in cuts:
         formatted = apply_prompt_format_fn(cut, prompt)
         cut.input_ids = formatted["input_ids"]
         cut.context_ids = formatted["context_ids"]
         cut.answer_ids = formatted["answer_ids"]
-    dataset = PromptedAudioToTextLhotseDataset(
-        tokenizer=asr_model.tokenizer, prompt=prompt, pack_sequences=pack_sequences
-    )
-    batch = dataset[cuts]
-    for cut in batch.cuts:
+    packed_batch = PromptedAudioToTextLhotseDataset(tokenizer=asr_model.tokenizer, prompt=prompt, pack_sequences=True)[
+        cuts
+    ]
+    for cut in packed_batch.cuts:
         assert not any(hasattr(cut, key) for key in ("input_ids", "context_ids", "answer_ids"))
         assert cut.target_lang == "en"
     assert all(hasattr(cut, "input_ids") for cut in cuts)
+    padded_batch = PromptedAudioToTextLhotseDataset(tokenizer=asr_model.tokenizer, prompt=prompt)[cuts]
+    assert all(hasattr(cut, "input_ids") for cut in padded_batch.cuts)
 
 
 @pytest.mark.unit
@@ -189,11 +190,10 @@ def test_conv_asr_decoder_forward_packed_matches_forward(deterministic_rng):
 @pytest.mark.unit
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinning needs CUDA")
-@pytest.mark.parametrize("pack_sequences", [False, True])
-def test_batch_pin_memory(asr_model, cuts, pack_sequences):
-    """Check that DataLoader(pin_memory=True) pins the tensors of a batch through its pin_memory method."""
-    padded_ds, packed_ds = _make_datasets(asr_model)
-    batch = (packed_ds if pack_sequences else padded_ds)[cuts]
+def test_packed_batch_pin_memory(asr_model, cuts):
+    """Check that DataLoader(pin_memory=True) pins the tensors of a packed batch through its pin_memory method."""
+    _, packed_ds = _make_datasets(asr_model)
+    batch = packed_ds[cuts]
     pinned = pin_memory(batch)
     assert type(pinned) is type(batch)
     for name, value in vars(pinned).items():

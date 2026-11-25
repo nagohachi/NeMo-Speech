@@ -686,7 +686,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
     def setup_training_data(self, train_data_config: Optional[DictConfig]):
 
-        self._check_packed_training_config(train_data_config)
+        _check_packed_training_config(self.cfg, train_data_config)
         # create audio-only data loader
         self._update_dataset_config(dataset_name='train', config=train_data_config)
         self._train_dl = self._setup_dataloader_from_config(config=train_data_config)
@@ -744,27 +744,6 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         # preserve config
         self._update_dataset_config(dataset_name='test', config=test_data_config)
         self._test_dl = self._setup_dataloader_from_config(config=test_data_config)
-
-    def _check_packed_training_config(self, train_data_config: Optional[DictConfig]):
-        """Refuse, before any data is read, the settings that the sequence-packed training step does not support.
-
-        ``train_ds.pack_sequences`` makes ``training_step`` run ``_training_step_packed`` on sequence-packed batches.
-        """
-        if not train_data_config or not train_data_config.get("pack_sequences", False):
-            return
-        transf_encoder = self.cfg.get("transf_encoder")
-        if transf_encoder is not None and transf_encoder.get("num_layers", 0) > 0:
-            raise ValueError("train_ds.pack_sequences: the Transformer encoder (transf_encoder) has no packed form.")
-        if self.cfg.loss.get("predict_last_k", 0):
-            raise ValueError(
-                "train_ds.pack_sequences: loss.predict_last_k would keep the last tokens of the whole packed batch, "
-                "not of each utterance. Set loss.predict_last_k to 0."
-            )
-        if self.cfg.get("train_batch_metrics", True):
-            raise ValueError(
-                "train_ds.pack_sequences: the sequence-packed training step does not decode its batch, so it logs no "
-                "training_batch metrics. Set train_batch_metrics: false."
-            )
 
     @property
     def input_types(self) -> Optional[Dict[str, NeuralType]]:
@@ -1665,6 +1644,28 @@ def _check_aux_ctc_config(aux_ctc_config) -> None:
         )
     if not isinstance(aux_ctc_config.get("zero_infinity", False), bool):
         raise ValueError(f"aux_ctc.zero_infinity must be a bool, got {aux_ctc_config.get('zero_infinity')!r}.")
+
+
+def _check_packed_training_config(model_config: DictConfig, train_data_config: Optional[DictConfig]):
+    """Refuse, before any data is read, the settings that the sequence-packed training step does not support.
+
+    ``train_ds.pack_sequences`` makes ``training_step`` run ``_training_step_packed`` on sequence-packed batches.
+    """
+    if not train_data_config or not train_data_config.get("pack_sequences", False):
+        return
+    transf_encoder_config = model_config.get("transf_encoder")
+    if transf_encoder_config is not None and transf_encoder_config.get("num_layers", 0) > 0:
+        raise ValueError("train_ds.pack_sequences: the Transformer encoder (transf_encoder) has no packed form.")
+    if model_config.loss.get("predict_last_k", 0):
+        raise ValueError(
+            "train_ds.pack_sequences: loss.predict_last_k would keep the last tokens of the whole packed batch, "
+            "not of each utterance. Set loss.predict_last_k to 0."
+        )
+    if model_config.get("train_batch_metrics", True):
+        raise ValueError(
+            "train_ds.pack_sequences: the sequence-packed training step does not decode its batch, so it logs no "
+            "training_batch metrics. Set train_batch_metrics: false."
+        )
 
 
 def _refuse_sequence_packing(config, name: str):

@@ -49,10 +49,6 @@ class PromptedAudioToTextMiniBatch:
         """
         return self.prompted_transcript[:, :-1], self.prompted_transcript[:, 1:]
 
-    def pin_memory(self) -> "PromptedAudioToTextMiniBatch":
-        """Return a copy with pinned tensors; see ``_pin_tensor_fields``."""
-        return _pin_tensor_fields(self)
-
 
 @dataclass
 class PackedPromptedAudioToTextMiniBatch:
@@ -197,7 +193,7 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
             prompt_lens=prompt_lens,
             prompted_transcript=prompts_with_answers,
             prompted_transcript_lens=prompts_with_answers_lens,
-            cuts=_drop_token_ids(_drop_in_memory_data(cuts)),
+            cuts=_drop_in_memory_data(cuts),
         )
 
     def _get_packed_batch(self, cuts: CutSet) -> PackedPromptedAudioToTextMiniBatch:
