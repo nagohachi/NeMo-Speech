@@ -828,6 +828,7 @@ def get_lhotse_dataloader_from_multi_config(
 
 def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=None) -> tuple[CutSampler, bool]:
     """Create a CutSampler from a dataloader config."""
+    _check_echo_options(config)
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, use_iterable_dataset = read_cutset_from_config(config)
     use_iterable_dataset = determine_use_iterable_dataset(use_iterable_dataset, config)
@@ -989,10 +990,7 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
         cuts = cuts.filter(TokenPerTokenFilter(config.min_tpt, config.max_tpt))
 
     # Data echoing after filtering, so that the copies are sampled (bucketed, packed) like other examples.
-    if config.echo_factor != 1:  # LazyEchoer rejects a factor below 1
-        if config.use_stateful_dataloader:
-            # the echo buffer and its random order are not part of the sampler state that a resume restores
-            raise ValueError("echo_factor != 1 cannot be combined with use_stateful_dataloader=True.")
+    if config.echo_factor != 1:  # _check_echo_options rejects a factor below 1
         cuts = CutSet(
             LazyEchoer(cuts, factor=config.echo_factor, buffer_size=config.echo_buffer_size, seed=config.shard_seed)
         )
@@ -1480,3 +1478,14 @@ def _cut_text_into_windows(cut, num_tokens: int, tokenizer) -> list:
         )
         ans.append(new_cut)
     return ans
+
+
+def _check_echo_options(config) -> None:
+    """Raise ``ValueError`` for data echoing options that ``get_lhotse_sampler_from_config`` cannot apply."""
+    if config.echo_factor < 1:
+        raise ValueError(f"echo_factor must be at least 1, got {config.echo_factor}.")
+    if config.echo_buffer_size < 1:
+        raise ValueError(f"echo_buffer_size must be positive, got {config.echo_buffer_size}.")
+    if config.echo_factor != 1 and config.use_stateful_dataloader:
+        # the echo buffer and its random order are not part of the sampler state that a resume restores
+        raise ValueError("echo_factor != 1 cannot be combined with use_stateful_dataloader=True.")

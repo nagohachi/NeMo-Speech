@@ -55,11 +55,25 @@ def test_echo_yields_every_example_factor_times(cuts):
 
 @pytest.mark.unit
 def test_echo_order_is_seeded_and_mixed(cuts):
-    first = [c.id for c in LazyEchoer(cuts, factor=2, buffer_size=10, seed=1)]
-    assert first == [c.id for c in LazyEchoer(cuts, factor=2, buffer_size=10, seed=1)]
-    assert first != [c.id for c in LazyEchoer(cuts, factor=2, buffer_size=10, seed=2)]
-    # the copies do not leave the buffer in source order next to their originals
-    assert any(not b.startswith(a) and not a.startswith(b) for a, b in zip(first[::2], first[1::2]))
+    """Check that the order depends only on the seed and that copies leave the buffer apart from their originals."""
+    echoed_ids = [c.id for c in LazyEchoer(cuts, factor=2, buffer_size=10, seed=1)]
+    assert echoed_ids == [c.id for c in LazyEchoer(cuts, factor=2, buffer_size=10, seed=1)]
+    assert echoed_ids != [c.id for c in LazyEchoer(cuts, factor=2, buffer_size=10, seed=2)]
+    position = {cut_id: i for i, cut_id in enumerate(echoed_ids)}
+    distances = [abs(position[f"{c.id}_repeat1"] - position[c.id]) for c in cuts]
+    assert max(distances) > 1
+
+
+@pytest.mark.unit
+def test_echo_order_changes_between_iterations(cuts):
+    """Check that a second pass over the same echoer has another order, reproduced by a new echoer."""
+    echoer = LazyEchoer(cuts, factor=2, buffer_size=10, seed=1)
+    first_pass_ids = [c.id for c in echoer]
+    second_pass_ids = [c.id for c in echoer]
+    assert sorted(first_pass_ids) == sorted(second_pass_ids)
+    assert first_pass_ids != second_pass_ids
+    replayed_echoer = LazyEchoer(cuts, factor=2, buffer_size=10, seed=1)
+    assert [[c.id for c in replayed_echoer] for _ in range(2)] == [first_pass_ids, second_pass_ids]
 
 
 @pytest.mark.unit
@@ -82,6 +96,24 @@ def test_dataloader_echo_factor(tmp_path, cuts):
 def test_dataloader_rejects_echo_factor_below_one(tmp_path, cuts, echo_factor):
     config = _make_config(tmp_path, cuts, echo_factor=echo_factor)
     with pytest.raises(ValueError, match="factor must be at least 1"):
+        get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=_Identity())
+
+
+@pytest.mark.unit
+def test_dataloader_splits_echoed_copies_across_ranks(tmp_path, cuts):
+    """Check that two ranks with an integer shard_seed together yield every original and copy exactly once."""
+    config = _make_config(tmp_path, cuts, echo_factor=2, echo_buffer_size=6)
+    seen_ids = []
+    for rank in (0, 1):
+        dl = get_lhotse_dataloader_from_config(config=config, global_rank=rank, world_size=2, dataset=_Identity())
+        seen_ids.extend(c.id for batch in dl for c in batch)
+    assert sorted(seen_ids) == sorted([c.id for c in cuts] + [f"{c.id}_repeat1" for c in cuts])
+
+
+@pytest.mark.unit
+def test_dataloader_rejects_echo_buffer_size_below_one_without_echoing(tmp_path, cuts):
+    config = _make_config(tmp_path, cuts, echo_factor=1, echo_buffer_size=0)
+    with pytest.raises(ValueError, match="echo_buffer_size must be positive"):
         get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=_Identity())
 
 

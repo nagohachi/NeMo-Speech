@@ -31,8 +31,10 @@ class LazyEchoer(IteratorNode):
     The copies are inserted into a buffer of ``buffer_size`` items, from which items leave in random order,
     so they usually reach the sampler at different times. They can still share a mini-batch: a copy has the duration
     and token count of its original, so a bucketing sampler puts both into the same bucket.
-    The copies share the in-memory data of the original (no extra storage reads or audio copies);
-    the ``k``-th copy (``k >= 1``) gets the id suffix ``_repeat{k}``.
+    The copies share the cut of the original, and the ``k``-th copy (``k >= 1``) gets the id suffix ``_repeat{k}``.
+    Storage reads drop only where the cut holds its audio, as with tarred and Lhotse Shar data: audio in separate
+    files is read again by the dataset for every copy. The buffer holds up to ``buffer_size`` cuts, with tarred and
+    Shar data including their audio bytes, in every dataloader worker.
     Augmentations applied after sampling (SpecAugment on the GPU, for example) draw new randomness per copy.
 
     The echo buffer and its random order are not saved in a dataloader state, so the dataloader refuses
@@ -43,7 +45,8 @@ class LazyEchoer(IteratorNode):
         factor: how many times every example is yielded; 1 passes the source through.
         buffer_size: how many items the random reordering holds.
         seed: the seed of the reordering; ``"trng"`` and ``"randomized"`` resolve per worker as in Lhotse samplers.
-            The RNG is created and seeded in ``__iter__``.
+            The RNG is created in ``__iter__`` and seeded with the seed plus the number of earlier iterations,
+            so every pass over the data has its own order.
     """
 
     def __init__(self, iterator: Iterable, factor: int, buffer_size: int, seed: int | str = "trng") -> None:
@@ -55,12 +58,14 @@ class LazyEchoer(IteratorNode):
         self.factor = factor
         self.buffer_size = buffer_size
         self.seed = seed
+        self.num_iters = 0
 
     def __iter__(self):
         if self.factor == 1:
             yield from self.source
             return
-        rng = random.Random(resolve_seed(self.seed))
+        rng = random.Random(resolve_seed(self.seed) + self.num_iters)
+        self.num_iters += 1
         buffer: list[Any] = []
         for item in self.source:
             buffer.append(item)
