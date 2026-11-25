@@ -664,12 +664,14 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             # Adding this to support processing audio files of arbitrary length by chunking them into hour-long segments.
             config.cut_into_windows_duration = 3600
             config.cut_into_windows_hop = 3600
-        # pack_sequences configures the dataset, not the Lhotse dataloader (which would log it as an ignored key);
-        # the copy without it is resolved while the config is still attached to the model config
+        # pack_sequences and int16_audio configure the dataset, not the Lhotse dataloader (which would log them as
+        # ignored keys); the copy without them is resolved while the config is still attached to the model config
         pack_sequences = config.get("pack_sequences", False)
-        if "pack_sequences" in config:
+        int16_audio = config.get("int16_audio", False)
+        if "pack_sequences" in config or "int16_audio" in config:
             config = OmegaConf.to_container(config, resolve=True) if isinstance(config, DictConfig) else dict(config)
-            del config["pack_sequences"]
+            config.pop("pack_sequences", None)
+            config.pop("int16_audio", None)
         return get_lhotse_dataloader_from_config(
             config,
             global_rank=global_rank,
@@ -680,6 +682,8 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 enable_chunking=enable_chunking,  # <-- enables chunking
                 # token-flat batches for the sequence-packed teacher forcing of training_step
                 pack_sequences=pack_sequences,
+                # their waveforms as int16 up to the preprocessor
+                int16_audio=int16_audio,
             ),
             tokenizer=self.tokenizer,
         )

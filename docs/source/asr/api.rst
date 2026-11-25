@@ -174,6 +174,10 @@ and it does not decode its batch, so it logs no ``training_batch`` metrics.
 
 In multi-GPU training, ``encoder.sync_max_audio_length: false`` keeps the encoder from reading the longest length across ranks back to the host at every step.
 
+With ``model.train_ds.int16_audio: true`` as well, the data loader workers decode the waveforms as 16-bit integers and keep them as ``int16`` through collation, pinning and the copy to the GPU (half the bytes of ``float32``);
+the preprocessor's ``forward_packed`` divides them by 32768 on the GPU, which gives the ``float32`` samples of the default path bit for bit.
+It reads single-source mono recordings from files or from memory (tarred datasets) without audio transforms and raises on other cuts.
+
 ``model.encoder.compile_packed_layers: true`` compiles the layers of the sequence-packed encoder forward with ``torch.compile``,
 and ``model.transf_decoder.config_dict.compile_packed_layers: true`` the blocks of the packed decoder forward,
 which speeds up the training step; evaluation and decoding run the padded forward, which is not compiled.
