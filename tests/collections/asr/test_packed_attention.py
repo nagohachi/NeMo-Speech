@@ -212,6 +212,35 @@ def test_sequence_slices_from_host_lengths():
     assert PackedAttentionContext(without).sequence_slices == ((0, 5), (5, 5), (5, 8))
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("lengths", [[3, 0, 2], [0, 0], [4]])
+def test_context_from_lengths_with_given_sizes_matches_read_sizes(lengths):
+    """Check that passing total_tokens and max_seqlen builds the same context as reading them from the lengths."""
+    lengths = torch.tensor(lengths)
+    read = PackedAttentionContext.from_lengths(lengths)
+    given = PackedAttentionContext.from_lengths(
+        lengths, total_tokens=int(lengths.sum()), max_seqlen=int(lengths.max()) if lengths.numel() else 0
+    )
+    assert (given.total_tokens, given.max_seqlen) == (read.total_tokens, read.max_seqlen)
+    assert torch.equal(given.cu_seqlens, read.cu_seqlens)
+    assert torch.equal(given.position_ids, read.position_ids)
+    assert given.sequence_slices == read.sequence_slices
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_context_from_lengths_with_given_sizes_reads_nothing_from_the_device():
+    """Check that total_tokens and max_seqlen spare from_lengths its device reads."""
+    lengths = torch.tensor([3, 0, 2], device="cuda")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        context = PackedAttentionContext.from_lengths(lengths, total_tokens=5, max_seqlen=3)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert context.cu_seqlens.tolist() == [0, 3, 3, 5]
+
+
 class TestPackedAttentionKeyWindow:
     """A limited attention context: the keys of every token narrowed to a window inside its utterance."""
 

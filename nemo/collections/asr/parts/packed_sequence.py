@@ -279,7 +279,7 @@ def unpack_encoder_output(packed: PackedEncoderActivations, *, total_length: int
         # the row of every token in the flattened (B * T, D) output: an index copy, which needs no device read,
         # where a boolean mask would count its rows on the host
         rows = packed_sequence_ids(packed) * total_length + packed_encoder_position_ids(packed)
-        output = output.view(-1, output.shape[-1]).index_copy(0, rows, packed.data).view(output.shape)
+        output.view(-1, output.shape[-1]).index_copy_(0, rows, packed.data)
     return output
 
 
