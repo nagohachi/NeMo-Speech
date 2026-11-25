@@ -61,7 +61,7 @@ class PackedPromptedAudioToTextMiniBatch:
 
     Args:
         audio: concatenated waveforms, shape ``(sum(audio_lens),)``: float32 samples in [-1, 1),
-            or int16 samples (the float32 samples times 32768) from a dataset with ``int16_audio``.
+            or int16 samples (the float32 samples times ``INT16_AUDIO_SCALE``) from a dataset with ``int16_audio``.
         audio_lens: samples per utterance, shape ``(B,)``.
         audio_cu_seqlens: cumulative samples, shape ``(B + 1,)``.
         decoder_input_ids: concatenated decoder inputs, shape ``(sum(prompted_transcript_lens - 1),)``.
@@ -120,7 +120,7 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
     Sequence packing:
     With `pack_sequences` the dataset returns a ``PackedPromptedAudioToTextMiniBatch``: the waveforms of all
     utterances in one row, without padding. With `int16_audio` as well, the waveforms stay 16-bit integers from the
-    decoder to the GPU (half the bytes to collate, pin and copy); the model's preprocessor divides them by 32768,
+    decoder to the GPU (half the bytes to collate, pin and copy); the model's preprocessor divides them by ``INT16_AUDIO_SCALE``,
     which gives the float32 samples of the default path bit for bit. It reads single-source mono recordings from
     files or from memory (tarred datasets) and raises on other cuts.
 

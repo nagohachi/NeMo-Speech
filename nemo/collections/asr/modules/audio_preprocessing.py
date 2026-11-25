@@ -25,6 +25,7 @@ from nemo.collections.asr.parts.packed_sequence import PackedEncoderActivations
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures
 from nemo.collections.asr.parts.submodules.spectr_augment import SpecAugment, SpecCutout
 from nemo.collections.audio.parts.utils.transforms import MFCC
+from nemo.collections.common.data.lhotse.audio_loading import INT16_AUDIO_SCALE
 from nemo.core.classes import Exportable, NeuralModule, typecheck
 from nemo.core.neural_types import (
     AudioSignal,
@@ -105,7 +106,8 @@ class AudioPreprocessor(NeuralModule, ABC):
 
         Args:
             input_signal: Concatenated waveform samples with shape `(sum(length),)`: float32 in [-1, 1),
-                or int16 samples, which are divided by 32768 here (on the device of the signal).
+                or int16 samples (``train_ds.int16_audio``), which are divided by ``INT16_AUDIO_SCALE`` here
+                on the device of the signal. Only this packed method takes int16 samples; ``forward`` does not.
             length: Per-waveform sample counts with shape `(B,)`.
             input_signal_cu_seqlens: Cumulative sample offsets with shape `(B + 1,)`.
             host_length: `length` on the host (a CPU tensor or a sequence of ints), when the caller knows it,
@@ -118,7 +120,7 @@ class AudioPreprocessor(NeuralModule, ABC):
         """
         if input_signal.dtype == torch.int16:
             # the float32 samples that soundfile reads from 16-bit audio, exactly: a power of two scales the integers
-            input_signal = input_signal.to(torch.float32) / 32768
+            input_signal = input_signal.to(torch.float32) / INT16_AUDIO_SCALE
         elif input_signal.dtype != torch.float32:
             logging.warning(
                 f"AudioPreprocessor received an input signal of dtype {input_signal.dtype}, rather than "

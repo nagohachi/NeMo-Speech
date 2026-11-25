@@ -38,7 +38,7 @@ from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 from nemo.collections.asr.parts.packed_sequence import pack_encoder_output
 from nemo.collections.common.data import apply_prompt_format_fn
 from nemo.collections.common.data.lhotse import dataloader as lhotse_dataloader
-from nemo.collections.common.data.lhotse.audio_loading import read_unpadded_audio_rows
+from nemo.collections.common.data.lhotse.audio_loading import INT16_AUDIO_SCALE, read_unpadded_audio_rows
 from nemo.collections.common.parts.adapter_modules import LinearAdapterConfig
 from nemo.collections.common.prompts.canary import CanaryPromptFormatter
 
@@ -73,58 +73,48 @@ def test_packed_batch_matches_padded_batch(asr_model, cuts):
 
 @pytest.mark.unit
 def test_int16_audio_packed_batch_scales_to_the_float_batch(asr_model, cuts):
-    """Check that with int16_audio the packed batch carries the 16-bit samples, which divided by 32768 are the
-    float32 samples."""
+    """Check that with int16_audio the packed batch carries the 16-bit samples, which divided by INT16_AUDIO_SCALE
+    are the float32 samples."""
     _, packed_ds = _make_datasets(asr_model)
-    floats, ints = packed_ds[cuts], _make_int16_dataset(asr_model)[cuts]
+    float_batch, int16_batch = packed_ds[cuts], _make_int16_dataset(asr_model)[cuts]
 
-    assert ints.audio.dtype == torch.int16
-    assert torch.equal(ints.audio.to(torch.float32) / 32768, floats.audio)
-    for name, value in vars(floats).items():
+    assert int16_batch.audio.dtype == torch.int16
+    assert torch.equal(int16_batch.audio.to(torch.float32) / INT16_AUDIO_SCALE, float_batch.audio)
+    for name, value in vars(float_batch).items():
         if torch.is_tensor(value) and name != "audio":
-            assert torch.equal(getattr(ints, name), value), name
-    assert ints.host_audio_lens == floats.host_audio_lens
+            assert torch.equal(getattr(int16_batch, name), value), name
+    assert int16_batch.host_audio_lens == float_batch.host_audio_lens
 
 
 @pytest.mark.unit
 def test_int16_audio_gives_the_float_features(asr_model, cuts):
-    """Check that the packed preprocessor divides int16 audio by 32768 itself: the features of the float audio,
-    bit for bit."""
+    """Check that the packed preprocessor scales int16 audio itself: the features of the float audio, bit for bit."""
     asr_model.eval()
     _, packed_ds = _make_datasets(asr_model)
-    features = []
-    for batch in (packed_ds[cuts], _make_int16_dataset(asr_model)[cuts]):
-        with torch.no_grad():
-            features.append(
-                asr_model.preprocessor.forward_packed(
-                    batch.audio, batch.audio_lens, batch.audio_cu_seqlens, host_length=batch.host_audio_lens
-                )
-            )
-    assert torch.equal(features[1].data, features[0].data)
-    assert torch.equal(features[1].lengths, features[0].lengths)
+    float_features, int16_features = (
+        _calc_packed_features(asr_model, batch) for batch in (packed_ds[cuts], _make_int16_dataset(asr_model)[cuts])
+    )
+    assert torch.equal(int16_features.data, float_features.data)
+    assert torch.equal(int16_features.lengths, float_features.lengths)
 
 
 @pytest.mark.unit
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_int16_audio_gives_the_float_features_on_cuda(asr_model, cuts):
-    """Check that the division by 32768 runs on the GPU: the CUDA features of the float audio, bit for bit."""
+    """Check that the int16 audio is scaled on the GPU: the CUDA features of the float audio, bit for bit."""
     asr_model = asr_model.cuda().eval()
     _, packed_ds = _make_datasets(asr_model)
-    features = []
-    for batch in (packed_ds[cuts], _make_int16_dataset(asr_model)[cuts]):
-        batch = _move_to_cuda(batch)
-        with torch.no_grad():
-            features.append(
-                asr_model.preprocessor.forward_packed(
-                    batch.audio, batch.audio_lens, batch.audio_cu_seqlens, host_length=batch.host_audio_lens
-                )
-            )
-    assert torch.equal(features[1].data, features[0].data)
+    float_features, int16_features = (
+        _calc_packed_features(asr_model, _move_to_cuda(batch))
+        for batch in (packed_ds[cuts], _make_int16_dataset(asr_model)[cuts])
+    )
+    assert torch.equal(int16_features.data, float_features.data)
 
 
 @pytest.mark.unit
 def test_int16_audio_needs_pack_sequences(asr_model):
+    """Check that int16_audio without pack_sequences raises: only the packed batches carry int16 audio."""
     with pytest.raises(ValueError, match="int16_audio needs pack_sequences"):
         PromptedAudioToTextLhotseDataset(
             tokenizer=asr_model.tokenizer, prompt=CanaryPromptFormatter(asr_model.tokenizer), int16_audio=True
@@ -145,6 +135,7 @@ def test_int16_audio_refuses_cuts_it_cannot_read_as_lhotse_does(asr_model, cuts)
 
 @pytest.mark.unit
 def test_int16_audio_drops_unreadable_cuts_only_when_fault_tolerant(asr_model, cuts):
+    """Check that a cut whose audio fails to decode raises, or is dropped with fault-tolerant audio loading."""
     cuts = cuts.to_eager()
     cuts[1].recording.sources[0].source = b"not audio"
     dataset = _make_int16_dataset(asr_model)
@@ -555,7 +546,7 @@ def test_int16_audio_through_model_setup(tmp_path, asr_model, cuts):
         tokenizer=asr_model.tokenizer, prompt=asr_model.prompt, pack_sequences=True
     )[CutSet.from_file(path)]
     assert batch.audio.dtype == torch.int16
-    assert torch.equal(batch.audio.to(torch.float32) / 32768, expected.audio)
+    assert torch.equal(batch.audio.to(torch.float32) / INT16_AUDIO_SCALE, expected.audio)
 
 
 @pytest.mark.unit
@@ -673,6 +664,14 @@ def _make_datasets(model):
     padded = PromptedAudioToTextLhotseDataset(tokenizer=model.tokenizer, prompt=prompt)
     packed = PromptedAudioToTextLhotseDataset(tokenizer=model.tokenizer, prompt=prompt, pack_sequences=True)
     return padded, packed
+
+
+def _calc_packed_features(model, batch):
+    """Return the packed features of the preprocessor of ``model`` for a packed batch."""
+    with torch.no_grad():
+        return model.preprocessor.forward_packed(
+            batch.audio, batch.audio_lens, batch.audio_cu_seqlens, host_length=batch.host_audio_lens
+        )
 
 
 def _make_int16_dataset(model):

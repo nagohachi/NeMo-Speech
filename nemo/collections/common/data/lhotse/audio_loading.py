@@ -32,6 +32,9 @@ from lhotse.utils import compute_num_samples
 
 from nemo.utils import logging
 
+# int16 samples divided by this are the float32 samples that soundfile reads from 16-bit PCM audio, exactly
+INT16_AUDIO_SCALE = 32768
+
 
 class LhotseAudioLoadingDatasetMixin:
     """Make a dataset's ``AudioSamples`` failure policy loader-configurable.
@@ -75,10 +78,11 @@ def read_unpadded_audio_rows(cuts: CutSet, load_audio: AudioSamples, *, dtype: t
     with a fault-tolerant ``load_audio`` the cuts that fail to load are dropped from both.
 
     ``dtype`` float32 gives Lhotse's samples in [-1, 1). ``dtype`` int16 decodes the 16-bit integer samples
-    with soundfile instead, half the bytes to collate, pin and copy to the GPU; divided by 32768 they are the
-    float32 samples bit for bit. It reads mono recordings from a file or from memory as Lhotse would
-    (same offset, sample count and length correction) and raises on cuts it cannot read that way
-    (several sources or channels, audio transforms, resampling, video, other source types).
+    with soundfile instead, half the bytes to collate, pin and copy to the GPU; divided by ``INT16_AUDIO_SCALE``
+    they are the float32 samples bit for bit. It reads mono 16-bit PCM recordings from a file or from memory as
+    Lhotse would (same offset, sample count and length correction) and raises on cuts it cannot read that way
+    (several sources or channels, audio transforms, resampling, video, other source types, other sample formats),
+    also when ``load_audio`` is fault-tolerant.
     """
     if dtype not in (torch.float32, torch.int16):
         raise ValueError(f"Unpadded audio rows are float32 or int16, got {dtype}.")
@@ -132,6 +136,11 @@ def _load_int16_audio(cut, suppress_errors: bool) -> np.ndarray | None:
         # Recording.load_audio reads to the end of the recording when the cut covers nearly all of it
         read_duration = None if isclose(duration, recording.duration, abs_tol=1e-3) else duration
         with soundfile.SoundFile(BytesIO(source.source) if source.type == "memory" else source.source) as audio:
+            if audio.subtype != "PCM_16":
+                # soundfile would quantize other samples to int16, which no longer match the float32 path
+                raise _UnsupportedInt16Audio(
+                    f"int16 audio rows cannot read cut {cut.id}: its audio is {audio.subtype}, not 16-bit PCM."
+                )
             if audio.samplerate != recording.sampling_rate or audio.channels != 1:
                 raise ValueError(
                     f"int16 audio rows cannot read cut {cut.id}: the audio has {audio.channels} channels at "
@@ -148,6 +157,8 @@ def _load_int16_audio(cut, suppress_errors: bool) -> np.ndarray | None:
                     f"int16 audio rows: cut {cut.id} requests {read_duration} s, the audio has {available_duration} s."
                 )
         return assert_and_maybe_fix_num_samples(samples, offset=offset, duration=duration, recording=recording)[0]
+    except _UnsupportedInt16Audio:
+        raise
     except Exception as error:
         if not suppress_errors:
             raise
@@ -170,3 +181,7 @@ def _get_int16_unsupported_reason(cut, recording) -> str | None:
     if source.type == "file" and ".tar/" in str(source.source):
         return "a file inside a tar archive (Lhotse's .tar/ paths)"
     return None
+
+
+class _UnsupportedInt16Audio(ValueError):
+    """Audio that the int16 reader cannot read exactly: a configuration error, raised also when fault-tolerant."""

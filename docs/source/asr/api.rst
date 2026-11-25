@@ -176,7 +176,7 @@ In multi-GPU training, ``encoder.sync_max_audio_length: false`` keeps the encode
 
 With ``model.train_ds.int16_audio: true`` as well, the data loader workers decode the waveforms as 16-bit integers and keep them as ``int16`` through collation, pinning and the copy to the GPU (half the bytes of ``float32``);
 the preprocessor's ``forward_packed`` divides them by 32768 on the GPU, which gives the ``float32`` samples of the default path bit for bit.
-It reads single-source mono recordings from files or from memory (tarred datasets) without audio transforms and raises on other cuts.
+It reads single-source mono 16-bit PCM recordings from files or from memory (tarred datasets) without audio transforms and raises on other cuts, also with fault-tolerant audio loading.
 
 ``model.encoder.compile_packed_layers: true`` compiles the layers of the sequence-packed encoder forward with ``torch.compile``,
 and ``model.transf_decoder.config_dict.compile_packed_layers: true`` the blocks of the packed decoder forward,
