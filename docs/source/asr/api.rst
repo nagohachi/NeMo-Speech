@@ -140,6 +140,11 @@ The packed path covers the training forward and backward and leaves out what the
 * learned positional encodings bound the sequence length by ``max_sequence_length`` as in the padded path;
 * a sequence without encoder states gets a zero cross-attention context, where the padded ``forward`` attends uniformly over its masked frames.
 
+The auxiliary CTC loss of ``EncDecMultiTaskModel`` (``model.aux_ctc``) adds a ``ConvASRDecoder`` on the encoder output and trains with
+``(1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss``.
+``ctc_reduction`` defaults to ``mean_volume``, the CTC loss divided by the number of target tokens, a per-token loss like the attention cross-entropy.
+The CTC targets are the transcript tokens without the prompt and without a final end-of-text token.
+
 
 .. _rnn-encoder-api:
 

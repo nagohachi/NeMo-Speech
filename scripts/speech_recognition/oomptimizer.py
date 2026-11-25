@@ -93,6 +93,9 @@ class ProfilingBatchGenerator:
 
     * ``name`` is required if objects of ``cls`` have to be constructed using keyword arguments.
 
+    ``"seq_length"`` may also be an integer, a fixed length that does not follow the bucket,
+    e.g. the prompt length of a prompted model.
+
     A simple schema example for a model using audio/lengths tensor pair (unsupervised/self-supervised)::
 
         >>> {
@@ -121,6 +124,11 @@ class ProfilingBatchGenerator:
     def __call__(self, input_seq_length: int, output_seq_length: int):
         B = self._current
         select_seq_length = {"input": input_seq_length, "output": output_seq_length}
+
+        def _get_seq_length(item: dict) -> int:
+            length = item["seq_length"]
+            return length if isinstance(length, int) else select_seq_length[length]
+
         batch = []
         names = []
         for item in self.schema["inputs"]:
@@ -133,16 +141,16 @@ class ProfilingBatchGenerator:
             elif not isinstance(nt, NeuralType):  # placeholder
                 tnsr = torch.tensor([])
             elif isinstance(nt.elements_type, AudioSignal):
-                seq_length = select_seq_length[item["seq_length"]]
+                seq_length = _get_seq_length(item)
                 tnsr = torch.randn(B, seq_length, dtype=torch.float32, device=self.device)
             elif isinstance(nt.elements_type, LengthsType):
-                seq_length = select_seq_length[item["seq_length"]]
+                seq_length = _get_seq_length(item)
                 tnsr = torch.ones(B, dtype=torch.long, device=self.device) * seq_length
             elif isinstance(nt.elements_type, LabelsType):
-                seq_length = select_seq_length[item["seq_length"]]
+                seq_length = _get_seq_length(item)
                 tnsr = torch.randint(0, item["vocab_size"], size=(B, seq_length), device=self.device)
             elif isinstance(nt.elements_type, MaskType):
-                seq_length = select_seq_length[item["seq_length"]]
+                seq_length = _get_seq_length(item)
                 tnsr = torch.ones(B, seq_length, device=self.device)
             else:
                 raise RuntimeError("Unexpected item in oomptimizer schema: {item}")
