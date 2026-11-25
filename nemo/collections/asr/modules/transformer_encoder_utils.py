@@ -20,8 +20,11 @@ from functools import lru_cache
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from nemo.core.utils.optional_libs import is_lib_available
 
 _flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
+# found without importing flash-attn (see _get_flash_attention_varlen)
+_FLASH_ATTN_INSTALLED = is_lib_available("flash_attn")
 
 
 def _get_flex_attention(x):
@@ -133,45 +136,53 @@ def _get_flash_attention_varlen_for_device(device):
 
 @lru_cache(maxsize=1)
 def _get_flash_attention_varlen():
-    """Resolve the external or ATen variable-length FlashAttention implementation."""
-    try:
-        from flash_attn import flash_attn_varlen_func
-    except (ImportError, ModuleNotFoundError):
-        flash_forward = getattr(torch.ops.aten, "_flash_attention_forward", None)
-        if flash_forward is None:
-            return None
+    """Resolve the external or ATen variable-length FlashAttention implementation.
 
-        def torch_flash_attention_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            *,
-            dropout_p,
-            softmax_scale,
-            causal,
-        ):
-            """Adapt the ATen FlashAttention operator to the external provider signature."""
-            return flash_forward(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dropout_p,
-                causal,
-                False,
-                scale=softmax_scale,
-            )[0]
+    torch.compile traces this lookup (it ignores the cache) in compiled packed layers: without flash-attn installed
+    no import is attempted, since a failing import inside a traced function breaks the graph.
+    """
+    if _FLASH_ATTN_INSTALLED:
+        try:
+            from flash_attn import flash_attn_varlen_func
 
-        torch_flash_attention_varlen._sequence_packed_provider = "aten"
-        return torch_flash_attention_varlen
-    return flash_attn_varlen_func
+            return flash_attn_varlen_func
+        except ImportError:
+            pass  # an installed build that cannot be imported: the ATen implementation
+    if getattr(torch.ops.aten, "_flash_attention_forward", None) is None:
+        return None
+    return _run_torch_flash_attention_varlen
+
+
+def _run_torch_flash_attention_varlen(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    *,
+    dropout_p,
+    softmax_scale,
+    causal,
+):
+    """Adapt the ATen FlashAttention operator to the external provider signature."""
+    return torch.ops.aten._flash_attention_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        causal,
+        False,
+        scale=softmax_scale,
+    )[0]
+
+
+_run_torch_flash_attention_varlen._sequence_packed_provider = "aten"
 
 
 def _forward_sequence_packed_layer(layer, x, **kwargs):

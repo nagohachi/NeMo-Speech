@@ -458,6 +458,17 @@ def test_flash_attention_varlen_aten_provider_is_reported(monkeypatch):
         transformer_encoder_utils_module._get_flash_attention_varlen.cache_clear()
 
 
+def test_flash_attention_varlen_lookup_compiles_into_one_graph():
+    """Check that the provider lookup, which torch.compile traces in compiled packed layers (ignoring the cache),
+    attempts no import of a missing flash-attn, since a failing import breaks the graph."""
+    torch._dynamo.reset()
+
+    def add_provider_flag(x):
+        return x + (transformer_encoder_utils_module._get_flash_attention_varlen() is not None)
+
+    assert torch.compile(add_provider_flag, fullgraph=True)(torch.zeros(1)).shape == (1,)
+
+
 def test_sequence_packed_adds_no_state_dict_keys_and_loads_strictly():
     encoder = _make_encoder(position="rope")
     before = set(encoder.state_dict())
