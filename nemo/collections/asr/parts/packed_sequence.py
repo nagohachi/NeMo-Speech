@@ -348,27 +348,14 @@ def compile_forward_packed():
     The module is an input of the compiled function, so the layers of a stack share one graph
     (Dynamo lifts their parameters as inputs), and the number of rows is dynamic, so batches of other sizes reuse it.
     The encoder and decoder layers of the sequence-packed forward call it when their ``compile_packed_layers``
-    option is on. Inside ``DistributedDataParallel`` the layer graphs are compiled whole (see the comment below).
+    option is on. Inside ``DistributedDataParallel`` the layer graphs are compiled whole
+    (see ``_compile_without_ddp_optimizer``).
     """
-    if not hasattr(torch._dynamo.config, "optimize_ddp"):
-        raise RuntimeError(
-            "compile_forward_packed turns off torch._dynamo.config.optimize_ddp, which this PyTorch version does "
-            f"not have (written for torch 2.12, found {torch.__version__})."
-        )
 
     def forward_packed(module, *args, **kwargs):
         return module.forward_packed(*args, **kwargs)
 
-    compiled = torch.compile(forward_packed, dynamic=True)
-
-    def run_compiled_forward_packed(module, *args, **kwargs):
-        # Dynamo's DDP optimizer, which splits a graph at the gradient bucket boundaries, fails on the packed layer
-        # graphs with BackendCompilerFailed on CUDA (torch 2.12). Compiled whole, one layer is a small part of the
-        # model, so the buckets still fill as the compiled layers finish their backward.
-        with torch._dynamo.config.patch(optimize_ddp=False):
-            return compiled(module, *args, **kwargs)
-
-    return run_compiled_forward_packed
+    return _compile_without_ddp_optimizer(forward_packed)
 
 
 def split_packed_data(data: Tensor, lengths: Tensor, cu_seqlens: Tensor) -> tuple[Tensor, ...]:
@@ -505,3 +492,24 @@ def _new_packed_encoder_activations(
 def _calc_slot_lengths(lengths: Tensor, alignment: int, gap: int) -> Tensor:
     """Return the slots of every utterance in ``packed_slot_layout``: ``ceil((L + gap) / alignment) * alignment``."""
     return torch.div(lengths + (gap + alignment - 1), alignment, rounding_mode="floor") * alignment
+
+
+def _compile_without_ddp_optimizer(fn):
+    """Return ``torch.compile(fn, dynamic=True)``, called with Dynamo's DDP optimizer off.
+
+    Inside ``DistributedDataParallel`` the DDP optimizer splits a graph at the gradient bucket boundaries, and it fails
+    on the packed layer graphs with BackendCompilerFailed on CUDA (torch 2.12). Compiled whole, one layer is a small
+    part of the model, so the buckets still fill as the compiled layers finish their backward.
+    """
+    if not hasattr(torch._dynamo.config, "optimize_ddp"):
+        raise RuntimeError(
+            "The packed layers turn off torch._dynamo.config.optimize_ddp, which this PyTorch version does not have "
+            f"(written for torch 2.12, found {torch.__version__})."
+        )
+    compiled = torch.compile(fn, dynamic=True)
+
+    def run_without_ddp_optimizer(*args, **kwargs):
+        with torch._dynamo.config.patch(optimize_ddp=False):
+            return compiled(*args, **kwargs)
+
+    return run_without_ddp_optimizer

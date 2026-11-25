@@ -577,6 +577,25 @@ class TestPackedConvSubsampling:
         assert subsampling_module._reads_neighbouring_frames(layer) is reads
 
     @pytest.mark.unit
+    def test_single_channel_conv_channels_last_matches_conv2d(self):
+        """Check that the unfolded first convolution of the channels-last packed path is the convolution,
+        channels-last."""
+        torch.manual_seed(0)
+        conv = ConvSubsampling("dw_striding", 8, 8, 12, 4).conv[0].double()
+        x = torch.randn(1, 1, 37, 8, dtype=torch.float64)
+        expected = conv(x).permute(0, 2, 3, 1)
+        torch.testing.assert_close(subsampling_module._run_single_channel_conv_channels_last(x, conv), expected)
+
+    @pytest.mark.unit
+    def test_triton_stack_does_not_run_on_cpu_or_without_fuse_triton(self):
+        """Check that the Triton kernels are chosen for CUDA input only, and only with fuse_triton."""
+        stack = ConvSubsampling("dw_striding", 8, 8, 12, 4, use_triton=True).conv
+        assert not stack.can_run_triton(torch.zeros(1))
+        stack.fuse_triton = False
+        if torch.cuda.is_available():
+            assert not stack.can_run_triton(torch.zeros(1, device="cuda"))
+
+    @pytest.mark.unit
     def test_rejects_unsupported_stacks(self):
         packed = pack_encoder_output(torch.randn(1, 10, 8), torch.tensor([10]))
         with pytest.raises(NotImplementedError):

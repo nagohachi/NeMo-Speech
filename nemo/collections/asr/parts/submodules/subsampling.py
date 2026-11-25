@@ -25,6 +25,7 @@ from torch.nn import LayerNorm
 from nemo.collections.asr.parts.packed_sequence import (
     PackedEncoderActivations,
     PackedSlotLayout,
+    _compile_without_ddp_optimizer,
     lengths_to_cu_seqlens,
     packed_slot_layout,
 )
@@ -787,7 +788,7 @@ class ConvSubsampling(torch.nn.Module):
         so that the output size needs no device read.
         Returns the valid output frames, their lengths, and a CPU copy of the lengths.
         """
-        if self.conv.fuse_triton and data.is_cuda and not torch.are_deterministic_algorithms_enabled():
+        if self.conv.can_run_triton(data):
             return self._forward_packed_group_channels_last(
                 data, lengths, host_lengths, slot_offsets, token_slots, total_slots
             )
@@ -856,20 +857,10 @@ class ConvSubsampling(torch.nn.Module):
             # conv0 -> ReLU -> mask -> first depthwise in the fused kernel of the padded forward, which never writes
             # the largest stage; it masks the first stage by the slots of the utterances instead of a length
             first_depthwise, first_pointwise = self.conv[2], self.conv[3]
-            stage_valid_mask = _make_packed_stage_mask_channels_last(
-                x.new_empty(
-                    (
-                        1,
-                        calculate_conv_output_size(
-                            total_slots, conv0.kernel_size[0], conv0.stride[0], _layer_padding(conv0)
-                        ),
-                        1,
-                        1,
-                    )
-                ),
-                current_offsets,
-                current_lengths,
-            ).view(-1)
+            num_stage_slots = calculate_conv_output_size(
+                total_slots, conv0.kernel_size[0], conv0.stride[0], _layer_padding(conv0)
+            )
+            stage_valid_mask = _make_valid_slot_mask(num_stage_slots, current_offsets, current_lengths).to(x.dtype)
             x, _ = fused_conv_relu_dw(
                 x,
                 conv0.weight,
@@ -928,10 +919,7 @@ class ConvSubsampling(torch.nn.Module):
     @staticmethod
     def _packed_stage_mask(x: torch.Tensor, slot_offsets: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """One for the slots inside an utterance's valid frames at this stage, zero elsewhere; shape (1, 1, S, 1)."""
-        positions = torch.arange(x.shape[2], device=x.device)
-        sequence_ids = torch.bucketize(positions, slot_offsets[1:], right=True)
-        valid = positions - slot_offsets[sequence_ids] < lengths[sequence_ids]
-        return valid.to(x.dtype).view(1, 1, -1, 1)
+        return _make_valid_slot_mask(x.shape[2], slot_offsets, lengths).to(x.dtype).view(1, 1, -1, 1)
 
     def forward(self, x, lengths):
         if self._time_strides is not None:
@@ -1226,16 +1214,8 @@ class MaskedConvSequential(nn.Sequential):
         x = x.unsqueeze(1)  # (batch, 1, time, features)
         current_lengths = lengths
 
-        # Tracing and export cannot capture a Triton launch, the fused kernel returns no input
-        # gradient, and its weight gradients accumulate through atomics, so their summation order
-        # varies between runs.
-        if (
-            self.fuse_triton
-            and x.is_cuda
-            and not x.requires_grad
-            and not torch.are_deterministic_algorithms_enabled()
-            and not (torch.jit.is_tracing() or torch.compiler.is_exporting())
-        ):
+        # the fused kernel returns no input gradient
+        if self.can_run_triton(x) and not x.requires_grad:
             x, current_lengths, mask = self._forward_fused(x, current_lengths)
         else:
             x, current_lengths, mask = self._forward_torch(x, current_lengths)
@@ -1243,6 +1223,19 @@ class MaskedConvSequential(nn.Sequential):
         # Final masking
         x = apply_channel_mask(x, mask)
         return x, current_lengths.long()
+
+    def can_run_triton(self, x: torch.Tensor) -> bool:
+        """Return whether the Triton kernels of this stack can run on ``x``.
+
+        Tracing and export cannot capture a Triton launch, and the weight gradients of the kernels accumulate
+        through atomics, so their summation order varies between runs (no deterministic algorithms).
+        """
+        return (
+            self.fuse_triton
+            and x.is_cuda
+            and not torch.are_deterministic_algorithms_enabled()
+            and not (torch.jit.is_tracing() or torch.compiler.is_exporting())
+        )
 
     def _forward_torch(self, x, current_lengths):
         mask = self._create_mask(x, current_lengths.long())
@@ -1345,17 +1338,12 @@ def _run_single_channel_conv_channels_last(x, conv):
 
     The patches of the kernel are unfolded and multiplied by the weight in one matmul, whose output is channels-last
     by construction; cuDNN returns this convolution in (1, C, H', W') for one input channel.
+    ``conv`` is the first convolution of ``dw_striding``: one input channel, no groups, no dilation.
     """
-    if conv.in_channels != 1 or conv.groups != 1 or tuple(conv.dilation) != (1, 1):
-        raise ValueError(
-            f"Expected a convolution with one input channel and no dilation, got in_channels={conv.in_channels}, "
-            f"groups={conv.groups}, dilation={conv.dilation}."
-        )
-    kernel_h, kernel_w = conv.kernel_size
-    stride_h, stride_w = conv.stride
-    pad_h, pad_w = conv.padding
-    out_h = (x.shape[2] + 2 * pad_h - kernel_h) // stride_h + 1
-    out_w = (x.shape[3] + 2 * pad_w - kernel_w) // stride_w + 1
+    out_h, out_w = (
+        calculate_conv_output_size(x.shape[axis], conv.kernel_size[i], conv.stride[i], (conv.padding[i],) * 2)
+        for i, axis in enumerate((2, 3))
+    )
     patches = nn.functional.unfold(x, conv.kernel_size, padding=conv.padding, stride=conv.stride)
     out = nn.functional.linear(patches[0].t(), conv.weight.flatten(1), conv.bias)
     return out.view(1, out_h, out_w, -1)
@@ -1368,14 +1356,9 @@ def _compile_relu_mask():
     def apply_relu_mask(x, mask):
         return torch.relu(x) * mask
 
-    compiled = torch.compile(apply_relu_mask, dynamic=True)
-
-    def run(x, mask):
-        # no Dynamo DDP optimizer inside DistributedDataParallel (see compile_forward_packed); nothing to split here
-        with torch._dynamo.config.patch(optimize_ddp=False):
-            return compiled(x, mask)
-
-    return run
+    # inside DistributedDataParallel as the packed layers are (see compile_forward_packed); one kernel has nothing
+    # for the DDP optimizer to split
+    return _compile_without_ddp_optimizer(apply_relu_mask)
 
 
 def _advance_packed_stage(layer, lengths, host_lengths, slot_offsets):
@@ -1389,10 +1372,14 @@ def _advance_packed_stage(layer, lengths, host_lengths, slot_offsets):
 
 def _make_packed_stage_mask_channels_last(x, slot_offsets, lengths):
     """Make the mask of a channels-last (1, S, F, C) stage: one inside the utterances' valid frames, zero elsewhere."""
-    positions = torch.arange(x.shape[1], device=x.device)
+    return _make_valid_slot_mask(x.shape[1], slot_offsets, lengths).to(x.dtype).view(1, -1, 1, 1)
+
+
+def _make_valid_slot_mask(num_slots: int, slot_offsets: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Return whether each of ``num_slots`` slots lies inside the valid frames of its utterance, shape (S,)."""
+    positions = torch.arange(num_slots, device=slot_offsets.device)
     sequence_ids = torch.bucketize(positions, slot_offsets[1:], right=True)
-    valid = positions - slot_offsets[sequence_ids] < lengths[sequence_ids]
-    return valid.to(x.dtype).view(1, -1, 1, 1)
+    return positions - slot_offsets[sequence_ids] < lengths[sequence_ids]
 
 
 def _reads_neighbouring_frames(layer):
