@@ -231,7 +231,7 @@ class MultiHeadAttention(nn.Module):
             The attention output, shape ``(T_total, n_feat)``.
         """
         with avoid_float16_autocast_context():
-            if torch.is_autocast_enabled():
+            if torch.is_autocast_enabled(x.device.type):
                 # one cast for the three projections, which would each cast the same input under autocast
                 x = x.to(torch.get_autocast_dtype(x.device.type))
             q = self.linear_q(x).view(-1, self.h, self.d_k)
