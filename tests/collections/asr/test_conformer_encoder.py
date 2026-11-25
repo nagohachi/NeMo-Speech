@@ -21,6 +21,8 @@ import random
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 
 from nemo.collections.asr.models import EncDecCTCModel
@@ -657,6 +659,79 @@ class TestPackedConformerEncoder:
         torch.testing.assert_close(packed_out.data, _valid_frames(padded_out, state_lengths))
         with pytest.raises(ValueError, match="length must match"):
             encoder.forward_sequence_packed(pack_encoder_output(features.transpose(1, 2), lengths), lengths - 1)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("self_attention_model", ["rel_pos", "rope"])
+    def test_compiled_layers_match_eager(self, self_attention_model):
+        """Check that compile_packed_layers gives the outputs and gradients of the eager layers through torch.compile.
+
+        The loss is a random projection of the output: the final layer norm makes a plain sum of squares almost
+        constant, which leaves only rounding noise as the gradient of the earlier layers.
+        The gradients that are zero in exact arithmetic (key biases under the softmax, the depthwise bias before
+        batch normalization) are rounding noise in both forms; the tolerance is relative to the largest gradient.
+        """
+        torch._dynamo.reset()
+        eager = _packed_encoder(self_attention_model=self_attention_model).train()
+        compiled = _packed_encoder(self_attention_model=self_attention_model, compile_packed_layers=True).train()
+        compiled.load_state_dict(eager.state_dict())
+        for lengths in (torch.tensor([20, 13]), torch.tensor([17, 9, 30])):
+            outputs, grads = [], []
+            for encoder in (eager, compiled):
+                encoder.zero_grad()
+                features = _packed_test_features(lengths, dtype=torch.float32).transpose(1, 2)
+                out = encoder.forward_sequence_packed(pack_encoder_output(features, lengths))
+                weights = torch.randn(out.data.shape, generator=torch.Generator().manual_seed(3))
+                (out.data * weights).sum().backward()
+                outputs.append(out.data.detach())
+                grads.append({name: p.grad.clone() for name, p in encoder.named_parameters() if p.grad is not None})
+            torch.testing.assert_close(outputs[1], outputs[0], rtol=1e-4, atol=1e-5)
+            assert grads[1].keys() == grads[0].keys()
+            scale = max(float(grad.abs().max()) for grad in grads[0].values())
+            for name, grad in grads[0].items():
+                torch.testing.assert_close(grads[1][name], grad, rtol=1e-4, atol=1e-5 * scale, msg=name)
+
+    @pytest.mark.unit
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.parametrize("self_attention_model", ["rel_pos", "rope"])
+    def test_compiled_layers_do_not_recompile_for_new_batch_shapes(self, self_attention_model):
+        """Check that on CUDA one compiled graph without breaks (the rel_pos Triton kernel, or FlashAttention
+        varlen with the rotary embedding fused into the graph) serves batches of other frame counts, utterance
+        counts and longest utterances."""
+        from torch._dynamo.utils import counters
+
+        torch._dynamo.reset()
+        counters.clear()
+        torch.manual_seed(5)
+        options = dict(self_attention_model=self_attention_model, dropout=0.1)
+        encoder = _packed_encoder(compile_packed_layers=True, **options).cuda().train()
+        reference = _packed_encoder(**options).cuda().eval()
+        graphs = []
+        for lengths in ([40, 26], [33, 18, 61], [50, 7, 12, 90]):
+            lengths = torch.tensor(lengths, device="cuda")
+            features = _packed_test_features(lengths, dtype=torch.float32, device="cuda").transpose(1, 2)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                out = encoder.forward_sequence_packed(pack_encoder_output(features, lengths))
+            out.data.float().square().sum().backward()
+            graphs.append(counters["stats"]["unique_graphs"])
+        assert graphs[2] == graphs[1], graphs
+        assert not counters["graph_break"], dict(counters["graph_break"])
+        # without dropout (eval mode) the compiled layers give the eager result up to bfloat16 rounding,
+        # compared in norm: the fused kernels round single elements differently
+        reference.load_state_dict(encoder.state_dict())
+        encoder.eval()
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            packed = pack_encoder_output(features, lengths)
+            compiled_out = encoder.forward_sequence_packed(packed).data.float()
+            eager_out = reference.forward_sequence_packed(packed).data.float()
+        assert (compiled_out - eager_out).norm() <= 1e-2 * eager_out.norm()
+
+    @pytest.mark.unit
+    @pytest.mark.timeout(1200)  # two spawned processes that compile the layers in two precisions
+    def test_compiled_layers_train_under_distributed_data_parallel(self, tmp_path):
+        """Check compile_packed_layers inside DistributedDataParallel on 2 ranks (gloo): the averaged gradients of the
+        eager layers in float32, and with a bfloat16-compressed all-reduce, see ``_run_compiled_layers_under_ddp``."""
+        mp.spawn(_run_compiled_layers_under_ddp, args=(2, str(tmp_path / "ddp_init"), "gloo"), nprocs=2, join=True)
 
     @pytest.mark.unit
     def test_output_carries_the_host_lengths(self):
@@ -1338,6 +1413,21 @@ class TestPackedConformerEncoderCuda:
             assert (parameter.grad - reference).norm() <= 0.1 * reference.norm() + 1e-5, name
 
     @pytest.mark.unit
+    @pytest.mark.timeout(1200)  # a spawned process that compiles the layers in two precisions
+    @pytest.mark.parametrize("self_attention_model", ["rel_pos", "rope"])
+    def test_compiled_layers_train_under_distributed_data_parallel(self, self_attention_model, tmp_path):
+        """Check compile_packed_layers in DistributedDataParallel on one GPU (NCCL): the eager gradients in float32,
+        and in the training precision as close to them as the eager layers, see ``_run_compiled_layers_under_ddp``."""
+        if self_attention_model == "rope" and not self._half_precision_flash_attention_available():
+            pytest.skip("requires a variable-length FlashAttention provider")
+        mp.spawn(
+            _run_compiled_layers_under_ddp,
+            args=(1, str(tmp_path / "ddp_init"), "nccl", self_attention_model),
+            nprocs=1,
+            join=True,
+        )
+
+    @pytest.mark.unit
     @pytest.mark.parametrize("self_attention_model", ["abs_pos", "rope"])
     def test_attention_dropout_runs_through_flash_attention_in_bf16(self, self_attention_model):
         if not self._half_precision_flash_attention_available():
@@ -1690,3 +1780,80 @@ class TestCacheAwareTraining:
             streamed = torch.cat(outputs, dim=-1)
             assert streamed.shape[-1] == train_len[i].item()
             torch.testing.assert_close(train_out[i, :, : train_len[i]], streamed, atol=1e-5, rtol=1e-5)
+
+
+class _PackedEncoderData(torch.nn.Module):
+    """The packed output rows of an encoder as the forward of a module, to wrap in DistributedDataParallel."""
+
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, features, lengths):
+        return self.encoder.forward_sequence_packed(features, lengths).data
+
+
+def _run_compiled_layers_under_ddp(rank, world_size, init_file, backend, self_attention_model="rel_pos"):
+    """Run on one rank two training steps of the packed encoder with eager and with compiled layers, each wrapped in
+    DistributedDataParallel with the options of the AED training runs (static graph, gradients as bucket views).
+
+    In float32 with a float32 all-reduce the compiled layers give the eager gradients up to rounding. With the
+    training precision (bfloat16 autocast on CUDA, bfloat16-compressed all-reduce) the compiled gradients are as
+    close to the float32 ones as the eager gradients are. The layers hold 1.5 MB of parameters, more than the first
+    gradient bucket (1 MB), so Dynamo's DDP optimizer would split their graphs at a bucket boundary.
+    """
+    cuda = backend == "nccl"
+    device = torch.device("cuda", rank) if cuda else torch.device("cpu")
+    if cuda:
+        torch.cuda.set_device(device)
+        # float32 means float32: no TF32 in the matmuls and convolutions of this process
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    dist.init_process_group(backend, init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        options = dict(device=device, rank=rank, self_attention_model=self_attention_model)
+        reference = _calc_ddp_gradients(compile_packed_layers=False, training_precision=False, **options)
+        scale = max(float(grad.abs().max()) for grad in reference.values())
+        compiled = _calc_ddp_gradients(compile_packed_layers=True, training_precision=False, **options)
+        assert compiled.keys() == reference.keys()
+        for name, grad in reference.items():
+            # the gradients that are zero in exact arithmetic are rounding noise, hence a floor at the largest one
+            error = float((compiled[name] - grad).norm())
+            assert error <= 1e-4 * float(grad.norm()) + 1e-6 * scale, (name, error, float(grad.norm()), scale)
+        eager = _calc_ddp_gradients(compile_packed_layers=False, training_precision=True, **options)
+        compiled = _calc_ddp_gradients(compile_packed_layers=True, training_precision=True, **options)
+        for name, grad in reference.items():
+            eager_error = float((eager[name] - grad).norm())
+            error = float((compiled[name] - grad).norm())
+            assert error <= 1.5 * eager_error + 2e-4 * scale, (name, error, eager_error, float(grad.norm()), scale)
+    finally:
+        dist.destroy_process_group()
+
+
+def _calc_ddp_gradients(*, device, rank, self_attention_model, compile_packed_layers, training_precision):
+    """Return the parameter gradients of two packed training steps under DDP, averaged over all ranks."""
+    from torch.distributed.algorithms.ddp_comm_hooks import default_hooks
+    from torch.nn.parallel import DistributedDataParallel
+
+    torch.manual_seed(0)
+    encoder = _packed_encoder(
+        self_attention_model=self_attention_model, d_model=128, n_heads=4, compile_packed_layers=compile_packed_layers
+    )
+    model = DistributedDataParallel(
+        _PackedEncoderData(encoder.to(device).train()),
+        device_ids=[device] if device.type == "cuda" else None,
+        bucket_cap_mb=1,
+        static_graph=True,
+        gradient_as_bucket_view=True,
+    )
+    if training_precision:
+        model.register_comm_hook(None, default_hooks.bf16_compress_hook)
+    # the ranks see different batches, and the second step other shapes than the first
+    for lengths in ([40 + rank, 26], [33, 18 + 5 * rank, 61]):
+        lengths = torch.tensor(lengths, device=device)
+        features = _packed_test_features(lengths, dtype=torch.float32, device=device)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=training_precision and device.type == "cuda"):
+            out = model(features, lengths)
+        weights = torch.randn(out.shape, generator=torch.Generator().manual_seed(3)).to(device)
+        (out.float() * weights).sum().backward()
+    return {name: p.grad.clone() for name, p in encoder.named_parameters() if p.grad is not None}

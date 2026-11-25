@@ -29,6 +29,7 @@ from nemo.collections.asr.models.configs import CacheAwareStreamingConfig
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from nemo.collections.asr.parts.packed_sequence import (
     PackedEncoderActivations,
+    compile_forward_packed,
     pack_encoder_output,
     packed_slot_layout,
 )
@@ -108,6 +109,12 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             the backend before the kernel, which computes in float32 and has no attention dropout.
             Keyword-only; defaults to 'triton'. In float64 both run the dense reference attention.
             A limited attention context runs FlexAttention with either value: the kernel has no key window.
+        compile_packed_layers (bool): run every layer of ``forward_sequence_packed`` through ``torch.compile``
+            with a dynamic frame count, one compiled function for all layers. Inductor fuses the normalizations,
+            activations, dropout, dtype conversions and residual additions around the matmuls and the attention
+            kernel; the values change by floating-point rounding (summation order, intermediates kept in float32)
+            and the dropout masks come from Inductor's random number generator.
+            The padded forward is not compiled. Keyword-only; defaults to False.
         reduction (str, Optional): the method of reduction, choices=['pooling', 'striding']. If no value
             is passed, then no reduction is performed and the models runs with the original 4x subsampling.
         reduction_position (int, Optional): the index of the layer to apply reduction. If -1, apply reduction
@@ -393,6 +400,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         norm: ModuleBlock | None = None,
         *,
         packed_rel_pos_attention: str = 'triton',
+        compile_packed_layers: bool = False,
     ):
         super().__init__()
         d_ff = d_model * ff_expansion_factor
@@ -407,6 +415,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if packed_rel_pos_attention not in ('triton', 'flex'):
             raise ValueError(f"packed_rel_pos_attention must be 'triton' or 'flex', got {packed_rel_pos_attention!r}.")
         self.packed_rel_pos_attention = packed_rel_pos_attention
+        self.compile_packed_layers = compile_packed_layers
         self.global_tokens = global_tokens
         self.global_attn_separate = global_attn_separate
         self.global_tokens_spacing = global_tokens_spacing
@@ -999,9 +1008,14 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
             original_signal = x
-            x = _forward_packed_module(
-                layer, x, attention_context=attention_context, conv_layout=conv_layout, pos_emb=pos_emb
-            )
+            if self.compile_packed_layers and not isinstance(layer, CheckpointWrapper):
+                x = compile_forward_packed()(
+                    layer, x, attention_context=attention_context, conv_layout=conv_layout, pos_emb=pos_emb
+                )
+            else:
+                x = _forward_packed_module(
+                    layer, x, attention_context=attention_context, conv_layout=conv_layout, pos_emb=pos_emb
+                )
             # stochastic depth as in forward_internal
             if self.training and drop_prob > 0.0:
                 should_drop = torch.rand(1) < drop_prob

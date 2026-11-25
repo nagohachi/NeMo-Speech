@@ -409,3 +409,64 @@ class TestPackedTransformerDecoder:
                 reference.norm(),
                 largest,
             )
+
+
+class TestCompiledPackedTransformerDecoder:
+    """compile_packed_layers: the blocks of forward_packed through torch.compile, against the eager blocks."""
+
+    @pytest.mark.unit
+    def test_compiled_layers_match_eager(self):
+        """Check outputs and gradients against the eager blocks; a gradient's tolerance is relative to the largest one,
+        since a key bias cancels in the softmax and its gradient is rounding noise in both forms."""
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        eager = _composed_decoder()
+        compiled = _composed_decoder(compile_packed_layers=True)
+        compiled.load_state_dict(eager.state_dict())
+        input_ids = torch.tensor([[10, 1, 5, 7, 2], [10, 3, 4, 0, 0], [10, 6, 0, 0, 0]])
+        input_lengths = torch.tensor([5, 3, 2])
+        encoder_lengths = torch.tensor([9, 4, 7])
+        encoder_states = torch.randn(3, 9, 16)
+        outputs, grads = [], []
+        for decoder in (eager, compiled):
+            packed = decoder.forward_packed(*_packed_inputs(input_ids, input_lengths, encoder_states, encoder_lengths))
+            weights = torch.randn(packed.shape, generator=torch.Generator().manual_seed(3))
+            (packed * weights).sum().backward()
+            outputs.append(packed.detach())
+            grads.append({name: p.grad.clone() for name, p in decoder.named_parameters() if p.grad is not None})
+        torch.testing.assert_close(outputs[1], outputs[0], rtol=1e-4, atol=1e-5)
+        assert grads[1].keys() == grads[0].keys()
+        scale = max(float(grad.abs().max()) for grad in grads[0].values())
+        for name, grad in grads[0].items():
+            torch.testing.assert_close(grads[1][name], grad, rtol=1e-4, atol=1e-5 * scale, msg=name)
+
+    @pytest.mark.unit
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_compiled_layers_on_cuda_without_graph_breaks_or_recompiles(self):
+        """Check that on CUDA (FlashAttention varlen, rotary self-attention) one graph serves other batch shapes."""
+        from torch._dynamo.utils import counters
+
+        torch._dynamo.reset()
+        counters.clear()
+        torch.manual_seed(1)
+        sizes = dict(vocab_size=11, hidden_size=64, num_layers=2, inner_size=96, num_attention_heads=2)
+        decoder = _composed_decoder(compile_packed_layers=True, ffn_dropout=0.1, **sizes).cuda().train()
+        graphs = []
+        for input_lengths, encoder_lengths in (
+            ([30, 17, 2], [200, 45, 130]),
+            ([12, 25], [90, 160]),
+            ([7, 30, 9, 21], [33, 120, 64, 200]),
+        ):
+            input_lengths = torch.tensor(input_lengths, device="cuda")
+            encoder_lengths = torch.tensor(encoder_lengths, device="cuda")
+            input_ids = torch.randint(1, 11, (len(input_lengths), 30), device="cuda")
+            encoder_states = torch.randn(len(encoder_lengths), 200, 64, device="cuda", requires_grad=True)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                packed = decoder.forward_packed(
+                    *_packed_inputs(input_ids, input_lengths, encoder_states, encoder_lengths)
+                )
+            packed.float().square().sum().backward()
+            graphs.append(counters["stats"]["unique_graphs"])
+        assert graphs[2] == graphs[1], graphs
+        assert not counters["graph_break"], dict(counters["graph_break"])
