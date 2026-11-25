@@ -222,6 +222,59 @@ class TestASRModulesBasicTests:
             )
 
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("exact_pad", "preemph", "normalize", "frame_splicing"),
+        [
+            (False, 0.97, "per_feature", 1),
+            (False, None, "all_features", 2),
+            (True, 0.97, None, 1),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "device",
+        [
+            pytest.param("cpu", marks=pytest.mark.skipif(torch.cuda.is_available(), reason="the CUDA case covers it")),
+            pytest.param(
+                "cuda",
+                marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")],
+            ),
+        ],
+    )
+    def test_AudioToMelSpectrogramPreprocessor_compiled_packed_matches_eager(
+        self, exact_pad, preemph, normalize, frame_splicing, device
+    ):
+        """Check that compile_packed in training mode (dither on) gives the eager frontend's features up to float32
+        rounding for two batches of different sizes, from three graphs without breaks or recompilations."""
+        options = dict(
+            normalize=normalize,
+            dither=1e-5,
+            pad_to=0,
+            exact_pad=exact_pad,
+            preemph=preemph,
+            frame_splicing=frame_splicing,
+        )
+        eager = modules.AudioToMelSpectrogramPreprocessor(**options).train().to(device)
+        compiled = modules.AudioToMelSpectrogramPreprocessor(**options, compile_packed=True).train().to(device)
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        # three utterances or more in both batches: the graphs guard on that (contiguity checks of (B, ...) tensors),
+        # which packed training batches always meet
+        for lengths in ([4096, 2500, 701, 400], [3000, 1700, 900]):
+            lengths = torch.tensor(lengths, dtype=torch.long, device=device)
+            torch.manual_seed(3)
+            packed = torch.randn(int(lengths.sum()), device=device) * 0.1
+            cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(dim=0)])
+            outputs = []
+            for preprocessor in (eager, compiled):
+                torch.manual_seed(5)  # the same dither noise
+                outputs.append(preprocessor.forward_packed(packed, lengths, cu_seqlens, host_length=lengths.cpu()))
+            expected, actual = outputs
+            assert torch.equal(actual.lengths, expected.lengths)
+            torch.testing.assert_close(actual.data, expected.data, rtol=1e-4, atol=1e-4)
+        assert not torch._dynamo.utils.counters["graph_break"]
+        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 3
+
+    @pytest.mark.unit
     def test_AudioToMelSpectrogramPreprocessor_packed_waveform_validates_metadata(self):
         preprocessor = modules.AudioToMelSpectrogramPreprocessor(dither=0, pad_to=0)
         packed = torch.zeros(6)

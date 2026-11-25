@@ -232,6 +232,11 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
             Defaults to False
         log_base: Base of the logarithm applied to the features; None for the natural logarithm.
             Defaults to None
+        compile_packed: Run the device work of the sequence-packed frontend (`forward_packed`) before and after its
+            STFT through `torch.compile` with dynamic sizes; the STFT itself stays eager. The features equal the
+            eager ones up to float32 rounding; the dither noise is drawn eagerly, so both draw the same samples.
+            The padded `forward` is unaffected.
+            Defaults to False
         stft_exact_pad: Deprecated argument, kept for compatibility with older checkpoints.
         stft_conv: Deprecated argument, kept for compatibility with older checkpoints.
     """
@@ -300,6 +305,7 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
         periodic_window: bool = False,
         snip_edges: bool = False,
         log_base: Optional[float] = None,
+        compile_packed: bool = False,
         use_torchaudio: bool = False,  # Deprecated arguments; kept for config compatibility
         stft_exact_pad=False,  # Deprecated arguments; kept for config compatibility
         stft_conv=False,  # Deprecated arguments; kept for config compatibility
@@ -346,6 +352,7 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
             periodic_window=periodic_window,
             snip_edges=snip_edges,
             log_base=log_base,
+            compile_packed=compile_packed,
             stft_exact_pad=stft_exact_pad,  # Deprecated arguments; kept for config compatibility
             stft_conv=stft_conv,  # Deprecated arguments; kept for config compatibility
         )
@@ -847,6 +854,7 @@ class AudioToMelSpectrogramPreprocessorConfig:
     periodic_window: bool = False
     snip_edges: bool = False
     log_base: Optional[float] = None
+    compile_packed: bool = False
     use_torchaudio: bool = False  # Deprecated argument, kept for compatibility with older checkpoints.
     stft_exact_pad: bool = False  # Deprecated argument, kept for compatibility with older checkpoints.
     stft_conv: bool = False  # Deprecated argument, kept for compatibility with older checkpoints.
