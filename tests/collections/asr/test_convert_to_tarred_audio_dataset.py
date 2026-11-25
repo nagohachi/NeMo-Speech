@@ -40,35 +40,17 @@ def load_converter():
 
 def _write_audio(path: Path, seconds: float) -> str:
     rng = np.random.default_rng(0)
-    soundfile.write(path, rng.uniform(-0.5, 0.5, int(16000 * seconds)), 16000, subtype="PCM_16")
+    subtype = "PCM_16" if path.suffix in (".wav", ".flac") else None
+    soundfile.write(path, rng.uniform(-0.5, 0.5, int(16000 * seconds)), 16000, subtype=subtype)
     return str(path)
 
 
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "source_ext,force_codec,slice_with_offset",
-    [
-        ("wav", "flac", True),  # cropped and transcoded
-        ("wav", "wav", True),  # cropped, same codec
-        ("flac", "wav", False),  # whole files, transcoded
-        ("wav", None, False),  # whole files stored as they are
-    ],
-)
-def test_manifest_names_tar_members(tmp_path, converter, source_ext, force_codec, slice_with_offset):
-    audio = _write_audio(tmp_path / f"talk.{source_ext}", 3.0)
-    other = _write_audio(tmp_path / f"other.{source_ext}", 1.0)
-    if slice_with_offset:
-        entries = [
-            {"audio_filepath": audio, "offset": 0.5, "duration": 1.0, "text": "a"},
-            {"audio_filepath": audio, "offset": 1.75, "duration": 1.25, "text": "b"},
-        ]
-    else:
-        # the second entry of the same file becomes a -sub entry of the first member
-        entries = [
-            {"audio_filepath": audio, "duration": 3.0, "text": "a"},
-            {"audio_filepath": audio, "duration": 3.0, "text": "b"},
-            {"audio_filepath": other, "duration": 1.0, "text": "c"},
-        ]
+def _squashed_base(audio_filepath: str) -> str:
+    """Return the member name stem that the converter makes from a source path, without the extension."""
+    return str(Path(audio_filepath).with_suffix("")).replace("/", "_").replace(".", "_")
+
+
+def _make_builder(converter, force_codec, slice_with_offset):
     config = converter.ASRTarredDatasetConfig(
         num_shards=1,
         max_duration=40.0,
@@ -79,16 +61,81 @@ def test_manifest_names_tar_members(tmp_path, converter, source_ext, force_codec
     )
     builder = converter.ASRTarredDatasetBuilder()
     builder.configure(config)
+    return builder
+
+
+def _make_entries(talk_filepath: str, other_filepath: str, slice_with_offset: bool) -> list[dict]:
+    if slice_with_offset:
+        return [
+            {"audio_filepath": talk_filepath, "offset": 0.5, "duration": 1.0, "text": "a"},
+            {"audio_filepath": talk_filepath, "offset": 1.75, "duration": 1.25, "text": "b"},
+        ]
+    # the second entry of the same file becomes a -sub entry of the first member
+    return [
+        {"audio_filepath": talk_filepath, "duration": 3.0, "text": "a"},
+        {"audio_filepath": talk_filepath, "duration": 3.0, "text": "b"},
+        {"audio_filepath": other_filepath, "duration": 1.0, "text": "c"},
+    ]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "source_ext,force_codec,slice_with_offset,member_ext",
+    [
+        ("wav", "flac", True, "flac"),  # cropped and transcoded
+        ("wav", "wav", True, "wav"),  # cropped, same codec
+        ("wav", "opus", True, "opus"),  # cropped into an ogg container named .opus
+        ("ogg", None, True, "ogg"),  # cropped and re-encoded in the format of the source
+        ("flac", "wav", False, "wav"),  # whole files, transcoded
+        ("flac", "opus", False, "opus"),  # whole files, transcoded into an ogg container named .opus
+        ("wav", None, False, "wav"),  # whole files stored as they are
+    ],
+)
+def test_manifest_names_tar_members(tmp_path, converter, source_ext, force_codec, slice_with_offset, member_ext):
+    """Check that the manifest entries, also with only_manifests, name the members written to the tar."""
+    talk_filepath = _write_audio(tmp_path / f"talk.{source_ext}", 3.0)
+    other_filepath = _write_audio(tmp_path / f"other.{source_ext}", 1.0)
+    entries = _make_entries(talk_filepath, other_filepath, slice_with_offset)
+    builder = _make_builder(converter, force_codec, slice_with_offset)
 
     new_entries = builder._create_shard([dict(e) for e in entries], str(tmp_path), shard_id=0)
-    manifest_only = builder._create_shard(
+    manifest_only_entries = builder._create_shard(
         [dict(e) for e in entries], str(tmp_path / "unused"), shard_id=0, only_manifests=True
     )
 
+    talk_base, other_base = _squashed_base(talk_filepath), _squashed_base(other_filepath)
+    if slice_with_offset:
+        expected_names = [f"{talk_base}_0_5_1_0.{member_ext}", f"{talk_base}_1_75_1_25.{member_ext}"]
+        expected_members = set(expected_names)
+    else:
+        expected_names = [f"{talk_base}.{member_ext}", f"{talk_base}-sub1.{member_ext}", f"{other_base}.{member_ext}"]
+        expected_members = {f"{talk_base}.{member_ext}", f"{other_base}.{member_ext}"}
     with tarfile.open(tmp_path / "audio_0.tar") as tar:
-        members = set(tar.getnames())
-    for entry in new_entries:
-        assert nemo_tar_audio_member_name(entry["audio_filepath"]) in members, (entry, members)
-    expected_ext = f".{force_codec or source_ext}"
-    assert all(name.endswith(expected_ext) for name in members)
-    assert [e["audio_filepath"] for e in manifest_only] == [e["audio_filepath"] for e in new_entries]
+        assert set(tar.getnames()) == expected_members
+    assert [e["audio_filepath"] for e in new_entries] == expected_names
+    assert [e["audio_filepath"] for e in manifest_only_entries] == expected_names
+    assert {nemo_tar_audio_member_name(name) for name in expected_names} == expected_members
+
+
+@pytest.mark.unit
+def test_only_manifests_without_source_audio_raises_when_the_name_needs_its_format(tmp_path, converter):
+    """Check that cropping without force_codec needs the source file to name the member."""
+    missing_filepath = str(tmp_path / "missing.opus")
+    entries = _make_entries(missing_filepath, missing_filepath, slice_with_offset=True)
+    builder = _make_builder(converter, force_codec=None, slice_with_offset=True)
+    with pytest.raises(FileNotFoundError, match="missing.opus"):
+        builder._create_shard(entries, str(tmp_path), shard_id=0, only_manifests=True)
+
+
+@pytest.mark.unit
+def test_only_manifests_without_source_audio_names_forced_codec_members(tmp_path, converter):
+    """Check that with force_codec the member names do not need the source file."""
+    missing_filepath = str(tmp_path / "missing.wav")
+    entries = _make_entries(missing_filepath, missing_filepath, slice_with_offset=True)
+    builder = _make_builder(converter, force_codec="flac", slice_with_offset=True)
+    manifest_only_entries = builder._create_shard(entries, str(tmp_path), shard_id=0, only_manifests=True)
+    missing_base = _squashed_base(missing_filepath)
+    assert [e["audio_filepath"] for e in manifest_only_entries] == [
+        f"{missing_base}_0_5_1_0.flac",
+        f"{missing_base}_1_75_1_25.flac",
+    ]
