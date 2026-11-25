@@ -244,7 +244,7 @@ class TestASRModulesBasicTests:
         self, exact_pad, preemph, normalize, frame_splicing, device
     ):
         """Check that compile_packed in training mode (dither on) gives the eager frontend's features up to float32
-        rounding for two batches of different sizes, from three graphs without breaks or recompilations."""
+        rounding for two batches of different sizes, from graphs without breaks that the second batch reuses."""
         options = dict(
             normalize=normalize,
             dither=1e-5,
@@ -259,20 +259,30 @@ class TestASRModulesBasicTests:
         torch._dynamo.utils.counters.clear()
         # three utterances or more in both batches: the graphs guard on that (contiguity checks of (B, ...) tensors),
         # which packed training batches always meet
-        for lengths in ([4096, 2500, 701, 400], [3000, 1700, 900]):
-            lengths = torch.tensor(lengths, dtype=torch.long, device=device)
-            torch.manual_seed(3)
-            packed = torch.randn(int(lengths.sum()), device=device) * 0.1
-            cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(dim=0)])
-            outputs = []
-            for preprocessor in (eager, compiled):
-                torch.manual_seed(5)  # the same dither noise
-                outputs.append(preprocessor.forward_packed(packed, lengths, cu_seqlens, host_length=lengths.cpu()))
-            expected, actual = outputs
-            assert torch.equal(actual.lengths, expected.lengths)
-            torch.testing.assert_close(actual.data, expected.data, rtol=1e-4, atol=1e-4)
-        assert not torch._dynamo.utils.counters["graph_break"]
-        assert torch._dynamo.utils.counters["stats"]["unique_graphs"] == 3
+        _assert_compiled_packed_frontend_matches_eager(eager, compiled, device)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "options",
+        [
+            dict(nb_augmentation_prob=1.0, nb_max_freq=4000),
+            dict(log_zero_guard_type="clamp"),
+            dict(mag_power=1.0),
+            dict(linear_spec=True),
+        ],
+        ids=["narrowband", "clamp", "mag_power_1", "linear_spec"],
+    )
+    def test_AudioToMelSpectrogramPreprocessor_compiled_packed_branches_match_eager(self, options):
+        """Check the branches of the compiled frontend that the default options skip (narrowband augmentation, the
+        clamp guard of the logarithm, magnitudes without squaring, linear spectra) against the eager frontend."""
+        options = dict(options)
+        linear_spec = options.pop("linear_spec", False)
+        common = dict(dither=1e-5, pad_to=0, **options)
+        eager = modules.AudioToMelSpectrogramPreprocessor(**common).train()
+        compiled = modules.AudioToMelSpectrogramPreprocessor(**common, compile_packed=True).train()
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        _assert_compiled_packed_frontend_matches_eager(eager, compiled, "cpu", linear_spec=linear_spec)
 
     @pytest.mark.unit
     def test_AudioToMelSpectrogramPreprocessor_packed_waveform_validates_metadata(self):
@@ -1101,3 +1111,33 @@ class TestASRModulesBasicTests:
 
         # assert vocab size
         assert jointnet.num_classes_with_blank == vocab_size + 1
+
+
+def _assert_compiled_packed_frontend_matches_eager(eager, compiled, device, linear_spec=False):
+    """Assert that two batches of different sizes give the eager features through the compiled packed frontend,
+    without graph breaks, and that the second batch compiles no new graph."""
+    graphs_per_batch = []
+    # three utterances or more in both batches: the graphs guard on that (contiguity checks of (B, ...) tensors),
+    # which packed training batches always meet
+    for lengths in ([4096, 2500, 701, 400], [3000, 1700, 900]):
+        lengths = torch.tensor(lengths, dtype=torch.long, device=device)
+        torch.manual_seed(3)
+        packed = torch.randn(int(lengths.sum()), device=device) * 0.1
+        cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(dim=0)])
+        outputs = []
+        for preprocessor in (eager, compiled):
+            torch.manual_seed(5)  # the same dither noise and narrowband draws
+            if linear_spec:
+                outputs.append(
+                    preprocessor.featurizer.forward_packed(
+                        packed, lengths, cu_seqlens, linear_spec=True, host_seq_len=lengths.cpu()
+                    )
+                )
+            else:
+                outputs.append(preprocessor.forward_packed(packed, lengths, cu_seqlens, host_length=lengths.cpu()))
+        expected, actual = outputs
+        assert torch.equal(actual.lengths, expected.lengths)
+        torch.testing.assert_close(actual.data, expected.data, rtol=1e-4, atol=1e-4)
+        graphs_per_batch.append(torch._dynamo.utils.counters["stats"]["unique_graphs"])
+    assert not torch._dynamo.utils.counters["graph_break"]
+    assert graphs_per_batch[0] > 0 and graphs_per_batch[1] == graphs_per_batch[0], graphs_per_batch

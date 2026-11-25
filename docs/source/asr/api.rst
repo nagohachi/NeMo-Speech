@@ -186,9 +186,9 @@ The first training steps take longer while the layers compile; batches of other 
 The values differ from the uncompiled layers by floating-point rounding, and dropout draws other random masks.
 The option cannot be combined with activation checkpointing of the encoder layers: the encoder raises an error.
 
-``model.preprocessor.compile_packed: true`` runs the device work of ``AudioToMelSpectrogramPreprocessor.forward_packed`` before and after its single STFT through ``torch.compile`` with dynamic sizes (three more graphs; the STFT stays eager):
-the positions of the samples in the guarded signal, dither and pre-emphasis, and then the selection of the valid frames, the magnitudes, the mel filter bank, the logarithm and the normalization.
-The dither noise is drawn outside the compiled functions, so the features equal those of the eager frontend up to floating-point rounding.
+``model.preprocessor.compile_packed: true`` compiles the feature computation of the sequence-packed training step (``train_ds.pack_sequences``) with ``torch.compile``,
+which speeds up the preprocessor; the STFT itself is not compiled, and evaluation and decoding run the uncompiled padded frontend.
+The first training steps take longer while it compiles, and the features equal those of the uncompiled frontend up to floating-point rounding.
 
 .. _rnn-encoder-api:
 
