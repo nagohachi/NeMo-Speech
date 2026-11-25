@@ -17,6 +17,7 @@ import functools
 import inspect
 import os
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -40,6 +41,7 @@ from nemo.collections.asr.parts.packed_sequence import (
 )
 from nemo.collections.asr.parts.submodules import conformer_modules as conformer_modules_module
 from nemo.collections.asr.parts.submodules import packed_attention as packed_attention_module
+from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
 from nemo.collections.asr.parts.submodules.conformer_modules import (
     ConformerConvolution,
     ConformerFeedForward,
@@ -613,6 +615,28 @@ class TestPackedConformerConvolution:
         padded_out[valid].square().sum().backward()
         packed_out.square().sum().backward()
         torch.testing.assert_close(packed_in.grad[valid], padded_in.grad[valid])
+
+    @pytest.mark.unit
+    def test_packed_row_kernel_runs_only_the_depthwise_convolution_it_covers(self, monkeypatch):
+        """Check the choice of the packed row kernel: a CausalConv1D depthwise convolution of the module on CUDA
+        with Triton; the CPU, a missing Triton, another convolution class, a stride or a dilation take the gapped
+        form. A stand-in tensor carries ``is_cuda``, so the check runs without a GPU."""
+        monkeypatch.setattr(conformer_modules_module, "TRITON_AVAILABLE", True)
+        cuda_x, cpu_x = SimpleNamespace(is_cuda=True), torch.zeros(1)
+        runs_kernel = conformer_modules_module._runs_packed_depthwise_kernel
+        depthwise = ConformerConvolution(d_model=8, kernel_size=9).depthwise_conv
+        causal_depthwise = ConformerConvolution(d_model=8, kernel_size=5, conv_context_size="causal").depthwise_conv
+        assert runs_kernel(depthwise, cuda_x) and runs_kernel(causal_depthwise, cuda_x)
+        assert not runs_kernel(depthwise, cpu_x)
+        for conv in (
+            torch.nn.Conv1d(8, 8, 9, padding=4, groups=8),
+            CausalConv1D(8, 8, 9, stride=2, padding=None, groups=8),
+            CausalConv1D(8, 8, 9, dilation=2, padding=None, groups=8),
+            CausalConv1D(8, 8, 9, padding=[4, 4], groups=1),
+        ):
+            assert not runs_kernel(conv, cuda_x), conv
+        monkeypatch.setattr(conformer_modules_module, "TRITON_AVAILABLE", False)
+        assert not runs_kernel(depthwise, cuda_x)
 
     @pytest.mark.unit
     @pytest.mark.gpu

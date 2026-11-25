@@ -33,17 +33,17 @@ pytestmark = [
 
 # lengths shorter than, equal to and longer than the kernels, single frames among them
 LENGTHS = [300, 1, 2, 3, 77, 9, 160, 4]
-# (channels, kernel_size, [left, right] context): the c180 geometry, an even kernel, a causal one,
+# (num_channels, kernel_size, [left, right] context): the c180 geometry, an even kernel, a causal one,
 # channel counts that do not fill the channel tiles
 GEOMETRIES = [(512, 9, [4, 4]), (48, 9, [4, 4]), (40, 4, [1, 2]), (24, 5, [4, 0])]
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.parametrize("channels,kernel_size,context", GEOMETRIES)
-def test_matches_gapped_convolution_in_float32(channels, kernel_size, context, bias):
+@pytest.mark.parametrize("has_bias", [True, False])
+@pytest.mark.parametrize("num_channels,kernel_size,context", GEOMETRIES)
+def test_matches_gapped_convolution_in_float32(num_channels, kernel_size, context, has_bias):
     """Check the output and the input, weight and bias gradients against the float64 gapped-slot convolution."""
-    conv, layout, x, grad = _make_case(channels, kernel_size, context, bias)
+    conv, layout, x, grad = _make_case(num_channels, kernel_size, context, has_bias)
     expected, expected_grads = _run_gapped(conv.double(), layout, x.double(), grad.double())
     conv.float()
     out, grads = _run_kernel(conv, layout, x, grad)
@@ -53,11 +53,11 @@ def test_matches_gapped_convolution_in_float32(channels, kernel_size, context, b
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("channels,kernel_size,context", GEOMETRIES[:2])
-def test_bf16_autocast_error_at_most_that_of_the_gapped_convolution(channels, kernel_size, context):
+@pytest.mark.parametrize("num_channels,kernel_size,context", GEOMETRIES[:2])
+def test_bf16_autocast_error_at_most_that_of_the_gapped_convolution(num_channels, kernel_size, context):
     """Check both forms under bfloat16 autocast against the float64 result: the kernel's error is at most 1.1 times the
     gapped convolution's (the kernel keeps the weight in float32, nn.Conv1d rounds it to bfloat16)."""
-    conv, layout, x, grad = _make_case(channels, kernel_size, context, bias=True)
+    conv, layout, x, grad = _make_case(num_channels, kernel_size, context, has_bias=True)
     expected, expected_grads = _run_gapped(conv.double(), layout, x.double(), grad.double())
     conv.float()
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -76,11 +76,11 @@ def test_compiles_without_graph_breaks_for_new_frame_counts():
     """Check that with fullgraph and dynamic shapes a second frame count runs the same graph and matches eager."""
     from torch._dynamo.testing import CompileCounterWithBackend
 
-    conv, layout, x, grad = _make_case(48, 9, [4, 4], bias=True)
+    conv, layout, x, grad = _make_case(48, 9, [4, 4], has_bias=True)
     torch._dynamo.reset()
     counter = CompileCounterWithBackend("inductor")
     compiled = torch.compile(_calc_squared_conv_sum, backend=counter, fullgraph=True, dynamic=True)
-    for case in ((conv, layout, x), _make_case(48, 9, [4, 4], bias=True, lengths=[50, 3, 1, 120])[:3]):
+    for case in ((conv, layout, x), _make_case(48, 9, [4, 4], has_bias=True, lengths=[50, 3, 1, 120])[:3]):
         conv, layout, x = case
         x = x.detach().requires_grad_()
         out = compiled(x, conv.weight, conv.bias, layout.token_slots)
@@ -96,6 +96,7 @@ def test_compiles_without_graph_breaks_for_new_frame_counts():
 
 @pytest.mark.unit
 def test_empty_input_returns_empty_output_and_zero_gradients():
+    """Check that no frames give an empty output and zero weight and bias gradients."""
     weight = torch.randn(8, 1, 9, device="cuda", requires_grad=True)
     bias = torch.randn(8, device="cuda", requires_grad=True)
     x = torch.zeros(0, 8, device="cuda", requires_grad=True)
@@ -107,7 +108,7 @@ def test_empty_input_returns_empty_output_and_zero_gradients():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "x_shape,weight_shape,slots,left,match",
+    "x_shape,weight_shape,num_slots,left_padding,match",
     [
         ((5, 8), (8, 1, 9), 5, 9, "left_padding"),
         ((5, 8), (4, 1, 9), 5, 4, "weight"),
@@ -115,26 +116,43 @@ def test_empty_input_returns_empty_output_and_zero_gradients():
         ((5, 8), (8, 1, 9), 4, 4, "token_slots"),
     ],
 )
-def test_rejects_inconsistent_arguments(x_shape, weight_shape, slots, left, match):
+def test_rejects_inconsistent_arguments(x_shape, weight_shape, num_slots, left_padding, match):
+    """Check that shapes and a left padding that do not fit together raise ValueError."""
     with pytest.raises(ValueError, match=match):
         run_packed_depthwise_conv1d(
             torch.zeros(x_shape, device="cuda"),
             torch.zeros(weight_shape, device="cuda"),
             None,
-            torch.arange(slots, device="cuda"),
-            left,
+            torch.arange(num_slots, device="cuda"),
+            left_padding,
         )
+
+
+@pytest.mark.unit
+def test_non_contiguous_input_and_bias_give_the_contiguous_result():
+    """Check that a strided input and a strided bias (views whose rows or elements are not adjacent) give the result
+    of their contiguous copies: the kernels index contiguous rows and read the bias with stride 1."""
+    conv, layout, x, _ = _make_case(48, 9, [4, 4], has_bias=True)
+    weight, bias = conv.weight.detach(), conv.bias.detach()
+    strided_x = x.t().contiguous().t()
+    strided_bias = torch.stack([bias, torch.zeros_like(bias)], dim=1)[:, 0]
+    assert not strided_x.is_contiguous() and not strided_bias.is_contiguous()
+    expected = run_packed_depthwise_conv1d(x, weight, bias, layout.token_slots, conv._left_padding)
+    actual = run_packed_depthwise_conv1d(strided_x, weight, strided_bias, layout.token_slots, conv._left_padding)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _calc_squared_conv_sum(x, weight, bias, token_slots):
     return run_packed_depthwise_conv1d(x, weight, bias, token_slots, 4).square().sum()
 
 
-def _make_case(channels, kernel_size, context, bias, lengths=LENGTHS):
+def _make_case(num_channels, kernel_size, context, has_bias, lengths=LENGTHS):
     torch.manual_seed(0)
-    conv = CausalConv1D(channels, channels, kernel_size, padding=context, groups=channels, bias=bias).cuda()
+    conv = CausalConv1D(
+        num_channels, num_channels, kernel_size, padding=context, groups=num_channels, bias=has_bias
+    ).cuda()
     lengths = torch.tensor(lengths, device="cuda")
-    features = torch.randn(len(lengths), int(lengths.max()), channels, device="cuda")
+    features = torch.randn(len(lengths), int(lengths.max()), num_channels, device="cuda")
     packed = pack_encoder_output(features, lengths)
     layout = packed_slot_layout(packed, gap=kernel_size - 1)
     grad = torch.randn_like(packed.data)

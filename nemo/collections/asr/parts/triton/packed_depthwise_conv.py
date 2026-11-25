@@ -88,6 +88,7 @@ def _run_conv_forward(
 ) -> Tensor:
     # a compiled graph may feed the op any layout; the kernels index contiguous rows
     x, weight, token_slots = x.contiguous(), weight.contiguous(), token_slots.contiguous()
+    bias = None if bias is None else bias.contiguous()  # the kernel reads the bias with stride 1
     out = torch.empty_like(x, memory_format=torch.contiguous_format)
     if x.numel() > 0:
         _launch_shifted_rows(x, weight, bias, token_slots, out, left_padding, mirrored=False)
@@ -115,13 +116,13 @@ def _run_conv_backward(
     _launch_shifted_rows(grad_out, weight, None, token_slots, grad_x, left_padding, mirrored=True)
     padded_num_taps = triton.next_power_of_2(kernel_size + 1)
     num_programs = triton.cdiv(x.shape[0], _ROWS_PER_PROGRAM)
-    partial = torch.empty((num_programs, padded_num_taps, num_channels), dtype=torch.float32, device=x.device)
+    partial_sums = torch.empty((num_programs, padded_num_taps, num_channels), dtype=torch.float32, device=x.device)
     grid = lambda meta: (num_programs, triton.cdiv(num_channels, meta["BLOCK_C"]))  # noqa: E731
     _sum_weight_grad_kernel[grid](
         x,
         grad_out,
         token_slots,
-        partial,
+        partial_sums,
         x.shape[0],
         num_channels,
         KERNEL=kernel_size,
@@ -129,10 +130,10 @@ def _run_conv_backward(
         TAPS_PAD=padded_num_taps,
         ROWS_PER_PROGRAM=_ROWS_PER_PROGRAM,
     )
-    sums = partial.sum(dim=0)
-    # outputs of a custom op may not alias each other: both gradients are copies out of the sums
-    grad_weight = sums[:kernel_size].t().to(weight.dtype, memory_format=torch.contiguous_format, copy=True)
-    return grad_x, grad_weight.reshape(weight.shape), sums[kernel_size].to(weight.dtype, copy=True)
+    total_sums = partial_sums.sum(dim=0)
+    # outputs of a custom op may not alias each other: both gradients are copies out of total_sums
+    grad_weight = total_sums[:kernel_size].t().to(weight.dtype, memory_format=torch.contiguous_format, copy=True)
+    return grad_x, grad_weight.reshape(weight.shape), total_sums[kernel_size].to(weight.dtype, copy=True)
 
 
 @_run_conv_backward.register_fake
@@ -223,25 +224,27 @@ def _sum_shifted_rows_kernel(
     """
     rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
-    row_ok = rows < num_rows
-    col_ok = cols < num_channels
-    slots = tl.load(slots_ptr + rows, mask=row_ok, other=0)
+    valid_row_mask = rows < num_rows
+    valid_channel_mask = cols < num_channels
+    slots = tl.load(slots_ptr + rows, mask=valid_row_mask, other=0)
     acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
     for tap in tl.static_range(KERNEL):
         shift = SIGN * (tap - LEFT)
         src_rows = rows + shift
-        ok = row_ok & (src_rows >= 0) & (src_rows < num_rows)
-        src_slots = tl.load(slots_ptr + src_rows, mask=ok, other=0)
+        same_utterance_mask = valid_row_mask & (src_rows >= 0) & (src_rows < num_rows)
+        src_slots = tl.load(slots_ptr + src_rows, mask=same_utterance_mask, other=0)
         # the frame `shift` rows away belongs to the same utterance exactly when it sits `shift` slots away
-        ok = ok & (src_slots - slots == shift)
-        w = tl.load(weight_ptr + cols * KERNEL + tap, mask=col_ok, other=0.0).to(tl.float32)
+        same_utterance_mask = same_utterance_mask & (src_slots - slots == shift)
+        weight_taps = tl.load(weight_ptr + cols * KERNEL + tap, mask=valid_channel_mask, other=0.0).to(tl.float32)
         offsets = src_rows.to(tl.int64)[:, None] * num_channels + cols[None, :]
-        values = tl.load(src_ptr + offsets, mask=ok[:, None] & col_ok[None, :], other=0.0)
-        acc += values.to(tl.float32) * w[None, :]
+        values = tl.load(src_ptr + offsets, mask=same_utterance_mask[:, None] & valid_channel_mask[None, :], other=0.0)
+        acc += values.to(tl.float32) * weight_taps[None, :]
     if HAS_BIAS:
-        acc += tl.load(bias_ptr + cols, mask=col_ok, other=0.0).to(tl.float32)[None, :]
+        acc += tl.load(bias_ptr + cols, mask=valid_channel_mask, other=0.0).to(tl.float32)[None, :]
     offsets = rows.to(tl.int64)[:, None] * num_channels + cols[None, :]
-    tl.store(out_ptr + offsets, acc.to(out_ptr.dtype.element_ty), mask=row_ok[:, None] & col_ok[None, :])
+    tl.store(
+        out_ptr + offsets, acc.to(out_ptr.dtype.element_ty), mask=valid_row_mask[:, None] & valid_channel_mask[None, :]
+    )
 
 
 @triton.autotune(configs=_make_weight_grad_configs(), key=["num_channels"])
@@ -266,27 +269,27 @@ def _sum_weight_grad_kernel(
     ``(TAPS_PAD, BLOCK_C)`` accumulator, so no reduction across rows is needed until the partials are summed.
     """
     cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
-    col_ok = cols < num_channels
+    valid_channel_mask = cols < num_channels
     taps = tl.arange(0, TAPS_PAD)
     shifts = taps - LEFT
     acc = tl.zeros((TAPS_PAD, BLOCK_C), dtype=tl.float32)
     bias_acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
-    first = tl.program_id(0) * ROWS_PER_PROGRAM
+    first_row = tl.program_id(0) * ROWS_PER_PROGRAM
     for i in range(ROWS_PER_PROGRAM):
-        row = first + i
-        row_ok = row < num_rows
-        slot = tl.load(slots_ptr + row, mask=row_ok, other=0)
-        grad = tl.load(grad_ptr + row.to(tl.int64) * num_channels + cols, mask=row_ok & col_ok, other=0.0).to(
-            tl.float32
-        )
+        row = first_row + i
+        valid_row_mask = row < num_rows
+        slot = tl.load(slots_ptr + row, mask=valid_row_mask, other=0)
+        grad = tl.load(
+            grad_ptr + row.to(tl.int64) * num_channels + cols, mask=valid_row_mask & valid_channel_mask, other=0.0
+        ).to(tl.float32)
         src_rows = row + shifts
-        ok = row_ok & (taps < KERNEL) & (src_rows >= 0) & (src_rows < num_rows)
-        src_slots = tl.load(slots_ptr + src_rows, mask=ok, other=0)
-        ok = ok & (src_slots - slot == shifts)
+        same_utterance_mask = valid_row_mask & (taps < KERNEL) & (src_rows >= 0) & (src_rows < num_rows)
+        src_slots = tl.load(slots_ptr + src_rows, mask=same_utterance_mask, other=0)
+        same_utterance_mask = same_utterance_mask & (src_slots - slot == shifts)
         offsets = src_rows.to(tl.int64)[:, None] * num_channels + cols[None, :]
-        window = tl.load(x_ptr + offsets, mask=ok[:, None] & col_ok[None, :], other=0.0)
+        window = tl.load(x_ptr + offsets, mask=same_utterance_mask[:, None] & valid_channel_mask[None, :], other=0.0)
         acc += window.to(tl.float32) * grad[None, :]
         bias_acc += grad
     acc += tl.where(taps[:, None] == KERNEL, bias_acc[None, :], 0.0)
     offsets = (tl.program_id(0) * TAPS_PAD + taps[:, None]).to(tl.int64) * num_channels + cols[None, :]
-    tl.store(partial_ptr + offsets, acc, mask=col_ok[None, :])
+    tl.store(partial_ptr + offsets, acc, mask=valid_channel_mask[None, :])
