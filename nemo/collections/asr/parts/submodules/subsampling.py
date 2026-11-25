@@ -791,8 +791,12 @@ class ConvSubsampling(torch.nn.Module):
         current_lengths = lengths.to(torch.int64)
         host_current_lengths = host_lengths.to(torch.int64)
         current_offsets = slot_offsets
-        for layer in self.conv:
-            x = x * self._packed_stage_mask(x, current_offsets, current_lengths)
+        # only a layer that reads neighbouring frames needs zeros outside the utterances; an activation or a 1x1
+        # convolution leaves garbage in the gaps that the next such layer's mask clears, and the final gather reads
+        # the valid frames alone, so the gaps never reach an output or a gradient. The input gaps are zero already.
+        for index, layer in enumerate(self.conv):
+            if index > 0 and _reads_neighbouring_frames(layer):
+                x = x * self._packed_stage_mask(x, current_offsets, current_lengths)
             x = layer(x)
             if hasattr(layer, 'stride') and layer.stride != (1, 1):
                 current_lengths, host_current_lengths = (
@@ -802,7 +806,6 @@ class ConvSubsampling(torch.nn.Module):
                     for value in (current_lengths, host_current_lengths)
                 )
                 current_offsets = torch.div(current_offsets, layer.stride[0], rounding_mode='floor')
-        x = x * self._packed_stage_mask(x, current_offsets, current_lengths)
 
         total_out = int(host_current_lengths.sum())
         out_sequence_ids = torch.repeat_interleave(
@@ -1228,6 +1231,14 @@ def _layer_padding(layer):
 def _time_axis(value):
     """The time (height) entry of a per-axis layer attribute, which pooling layers may keep as one int."""
     return value[0] if isinstance(value, (tuple, list)) else value
+
+
+def _reads_neighbouring_frames(layer):
+    """Check whether a layer's output frame reads other input frames: a time kernel above one or time padding."""
+    if not isinstance(layer, (nn.Conv1d, nn.Conv2d, nn.MaxPool2d)):
+        return False  # activations
+    kernel = (_time_axis(layer.kernel_size) - 1) * _time_axis(layer.dilation) + 1
+    return kernel > 1 or any(_layer_padding(layer))
 
 
 def _is_depthwise(layer):

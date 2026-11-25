@@ -527,6 +527,23 @@ class TestPackedConvSubsampling:
             assert out.max_seqlen == int(out.lengths.max())
 
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "layer, reads",
+        [
+            (torch.nn.Conv2d(2, 2, kernel_size=3, stride=2, padding=1), True),
+            (torch.nn.Conv2d(2, 2, kernel_size=3, stride=2, padding=1, groups=2), True),
+            (torch.nn.Conv2d(2, 2, kernel_size=(1, 3), padding=(0, 1)), False),
+            (torch.nn.Conv2d(2, 2, kernel_size=1), False),
+            (torch.nn.Conv2d(2, 2, kernel_size=1, padding=(1, 0)), True),
+            (torch.nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)), False),
+            (torch.nn.ReLU(), False),
+        ],
+    )
+    def test_masks_only_layers_that_read_neighbouring_frames(self, layer, reads):
+        """Check that the gaps between utterances are zeroed only before a layer that reads neighbouring frames."""
+        assert subsampling_module._reads_neighbouring_frames(layer) is reads
+
+    @pytest.mark.unit
     def test_rejects_unsupported_stacks(self):
         packed = pack_encoder_output(torch.randn(1, 10, 8), torch.tensor([10]))
         with pytest.raises(NotImplementedError):
