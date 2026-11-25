@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import MISSING, DictConfig, ListConfig, OmegaConf
 
+from nemo.collections.asr.parts.packed_sequence import PackedEncoderActivations
 from nemo.collections.asr.parts.submodules.jasper import (
     JasperBlock,
     MaskedConv1d,
@@ -467,6 +468,26 @@ class ConvASRDecoder(NeuralModule, Exportable, adapter_mixins.AdapterModuleMixin
                 self.decoder_layers(encoder_output).transpose(1, 2) / self.temperature, dim=-1
             )
         return torch.nn.functional.log_softmax(self.decoder_layers(encoder_output).transpose(1, 2), dim=-1)
+
+    def forward_packed(self, encoder_output: PackedEncoderActivations) -> PackedEncoderActivations:
+        """Compute the log probabilities of sequence-packed encoder states frame by frame, as ``forward`` does.
+
+        The pointwise convolution of ``forward`` is a linear map of every frame,
+        applied here to the data ``(T_total, feat_in)`` of the packed states.
+
+        Args:
+            encoder_output: packed encoder states with data ``(T_total, feat_in)``.
+
+        Returns:
+            The log probabilities with data ``(T_total, num_classes_with_blank)`` and the same boundaries.
+        """
+        if self.is_adapter_available():
+            raise NotImplementedError("Adapters are not supported in the sequence-packed ConvASRDecoder.")
+        conv = self.decoder_layers[0]
+        logits = F.linear(encoder_output.data, conv.weight.squeeze(-1), conv.bias)
+        if self.temperature != 1.0:
+            logits = logits / self.temperature
+        return encoder_output.with_data(F.log_softmax(logits, dim=-1))
 
     def input_example(self, max_batch=1, max_dim=256):
         """

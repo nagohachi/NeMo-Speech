@@ -54,7 +54,7 @@ Auxiliary CTC loss of EncDecMultiTaskModel
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``model.aux_ctc`` adds a ``ConvASRDecoder`` on the encoder output of ``EncDecMultiTaskModel`` and trains with
-``(1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss``.
+``(1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss``, in the padded and in the sequence-packed training step.
 The CTC targets are the transcript tokens without the prompt; the Canary prompt formats already leave the end-of-text token out of them.
 
 * ``ctc_loss_weight`` (default ``0.0``, no CTC loss): a number from 0 up to but not including 1; at 1 the attention decoder would get no loss and not train.
@@ -157,6 +157,18 @@ The packed path covers the training forward and backward and leaves out what the
 * learned positional encodings bound the sequence length by ``max_sequence_length`` as in the padded path;
 * a sequence without encoder states gets a zero cross-attention context, where the padded ``forward`` attends uniformly over its masked frames.
 
+``EncDecMultiTaskModel`` trains on sequence-packed batches when ``model.train_ds.pack_sequences`` is true.
+``PromptedAudioToTextLhotseDataset`` then collates a ``PackedPromptedAudioToTextMiniBatch`` (the samples of all utterances in one row, with their lengths and boundaries),
+and ``training_step`` runs the preprocessor, ``ConformerEncoder.forward_sequence_packed``, ``TransformerDecoderNM.forward_packed`` and the losses on token-flat tensors.
+Fill such batches to a budget of encoder frames with ``use_packed_sequence_sampling: true`` and ``batch_tokens`` (see the Lhotse dataloading documentation).
+The model raises at setup for the settings the packed step does not support:
+
+* ``pack_sequences`` in ``validation_ds`` or ``test_ds``: evaluation runs on padded batches;
+* a Transformer encoder between encoder and decoder (``transf_encoder.num_layers`` above 0);
+* ``loss.predict_last_k`` other than 0, which would keep the last tokens of the whole packed batch;
+* ``train_batch_metrics`` true: the packed step does not decode its batch, so set ``train_batch_metrics: false``.
+
+In multi-GPU training, ``encoder.sync_max_audio_length: false`` keeps the encoder from reading the longest length across ranks back to the host at every step.
 
 .. _rnn-encoder-api:
 

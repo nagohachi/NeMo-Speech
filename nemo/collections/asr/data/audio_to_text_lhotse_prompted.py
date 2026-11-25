@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import os
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -23,7 +24,7 @@ from lhotse.dataset.collation import collate_vectors
 
 from nemo.collections.asr.data.audio_to_text_lhotse import _make_audio_samples
 from nemo.collections.common.data import apply_prompt_format_fn
-from nemo.collections.common.data.lhotse.audio_loading import LhotseAudioLoadingDatasetMixin
+from nemo.collections.common.data.lhotse.audio_loading import LhotseAudioLoadingDatasetMixin, read_unpadded_audio_rows
 from nemo.collections.common.prompts import PromptFormatter
 from nemo.collections.common.tokenizers import TokenizerSpec
 
@@ -47,6 +48,55 @@ class PromptedAudioToTextMiniBatch:
         and the output is ``prompted_transcript`` (minus first token).
         """
         return self.prompted_transcript[:, :-1], self.prompted_transcript[:, 1:]
+
+    def pin_memory(self) -> "PromptedAudioToTextMiniBatch":
+        """Return a copy with pinned tensors; see ``_pin_tensor_fields``."""
+        return _pin_tensor_fields(self)
+
+
+@dataclass
+class PackedPromptedAudioToTextMiniBatch:
+    """A training mini-batch of a prompted AED model without inter-utterance padding.
+
+    The waveforms are concatenated into one 1D tensor and the teacher-forcing sequences into token-flat tensors,
+    with explicit boundaries instead of padding.
+    The decoder input of an utterance is its prompted transcript without the last token,
+    the target the prompted transcript without the first token, so both have ``prompted_transcript_lens - 1`` tokens.
+
+    Args:
+        audio: concatenated waveforms, shape ``(sum(audio_lens),)``.
+        audio_lens: samples per utterance, shape ``(B,)``.
+        audio_cu_seqlens: cumulative samples, shape ``(B + 1,)``.
+        decoder_input_ids: concatenated decoder inputs, shape ``(sum(prompted_transcript_lens - 1),)``.
+        decoder_targets: concatenated targets, same shape as ``decoder_input_ids``.
+        prompted_transcript_lens: prompt plus transcript tokens per utterance, shape ``(B,)``.
+        prompt_lens: prompt tokens per utterance, shape ``(B,)``.
+        transcript: the answer tokens of the prompt format, padded, shape ``(B, U)``,
+            as ``PromptedAudioToTextMiniBatch.transcript``; the targets of an auxiliary CTC loss.
+        transcript_lens: transcript tokens per utterance, shape ``(B,)``.
+        max_decoder_len: the longest decoder input of the batch, ``max(prompted_transcript_lens) - 1``,
+            a host integer, so that a consumer needs no device read for it.
+        cuts: the utterances of the batch, in order.
+        host_audio_lens: ``audio_lens`` as a tuple of ints, which stays on the host when the batch moves to the GPU,
+            so that the packed frontend sizes its computation without a device read.
+    """
+
+    audio: torch.Tensor
+    audio_lens: torch.Tensor
+    audio_cu_seqlens: torch.Tensor
+    decoder_input_ids: torch.Tensor
+    decoder_targets: torch.Tensor
+    prompted_transcript_lens: torch.Tensor
+    prompt_lens: torch.Tensor
+    transcript: torch.Tensor
+    transcript_lens: torch.Tensor
+    max_decoder_len: int
+    cuts: Optional[CutSet] = None
+    host_audio_lens: Optional[tuple[int, ...]] = None
+
+    def pin_memory(self) -> "PackedPromptedAudioToTextMiniBatch":
+        """Return a copy with pinned tensors; see ``_pin_tensor_fields``."""
+        return _pin_tensor_fields(self)
 
 
 class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.utils.data.Dataset):
@@ -81,8 +131,12 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
         tokenizer: TokenizerSpec,
         prompt: PromptFormatter,
         enable_chunking: bool = False,
+        pack_sequences: bool = False,
     ):
         super().__init__()
+        if pack_sequences and enable_chunking:
+            raise ValueError("pack_sequences and enable_chunking cannot be combined.")
+        self.pack_sequences = pack_sequences
         self.tokenizer = tokenizer
         self.use_ais_get_batch = os.environ.get("USE_AIS_GET_BATCH", "False").lower() == "true"
         self.ais_force_individual = os.environ.get("USE_AIS_INDIVIDUAL_GETS", "False").lower() == "true"
@@ -96,7 +150,9 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
         self.prompt = prompt
         self.enable_chunking = enable_chunking
 
-    def __getitem__(self, cuts: CutSet) -> PromptedAudioToTextMiniBatch:
+    def __getitem__(self, cuts: CutSet) -> PromptedAudioToTextMiniBatch | PackedPromptedAudioToTextMiniBatch:
+        if self.pack_sequences:
+            return self._get_packed_batch(cuts)
         # Load the audio's from AIS and add them to the CutSet
         audio, audio_lens, cuts = self.load_audio_with_cuts(cuts)
 
@@ -141,7 +197,45 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
             prompt_lens=prompt_lens,
             prompted_transcript=prompts_with_answers,
             prompted_transcript_lens=prompts_with_answers_lens,
-            cuts=_drop_in_memory_data(cuts),
+            cuts=_drop_token_ids(_drop_in_memory_data(cuts)),
+        )
+
+    def _get_packed_batch(self, cuts: CutSet) -> PackedPromptedAudioToTextMiniBatch:
+        rows, cuts = read_unpadded_audio_rows(cuts, self.load_audio)
+        host_audio_lens = tuple(row.numel() for row in rows)
+        audio_lens = torch.tensor(host_audio_lens, dtype=torch.long)
+        audio_cu_seqlens = torch.zeros(len(rows) + 1, dtype=torch.long)
+        torch.cumsum(audio_lens, dim=0, out=audio_cu_seqlens[1:])
+        audio = torch.cat(rows) if rows else torch.empty(0, dtype=torch.float32)
+
+        prompted_ids, prompt_lens, answers = [], [], []
+        for cut in cuts:
+            if all(hasattr(cut, a) for a in ("input_ids", "context_ids", "answer_ids")):
+                input_ids, context_ids, answer_ids = cut.input_ids, cut.context_ids, cut.answer_ids
+            else:
+                formatted = apply_prompt_format_fn(cut, self.prompt)
+                input_ids, context_ids = formatted["input_ids"], formatted["context_ids"]
+                answer_ids = formatted["answer_ids"]
+            prompted_ids.append(torch.as_tensor(input_ids, dtype=torch.long))
+            prompt_lens.append(len(context_ids))
+            answers.append(torch.as_tensor(answer_ids, dtype=torch.long))
+        if any(seq.numel() < 2 for seq in prompted_ids):
+            raise ValueError("Every prompted transcript needs at least two tokens for teacher forcing.")
+        empty_ids = torch.empty(0, dtype=torch.long)
+        transcript, transcript_lens = self._collate_tokens(answers or [empty_ids])
+        return PackedPromptedAudioToTextMiniBatch(
+            audio=audio,
+            audio_lens=audio_lens,
+            audio_cu_seqlens=audio_cu_seqlens,
+            decoder_input_ids=torch.cat([seq[:-1] for seq in prompted_ids]) if prompted_ids else empty_ids,
+            decoder_targets=torch.cat([seq[1:] for seq in prompted_ids]) if prompted_ids else empty_ids,
+            prompted_transcript_lens=torch.tensor([seq.numel() for seq in prompted_ids], dtype=torch.long),
+            prompt_lens=torch.tensor(prompt_lens, dtype=torch.long),
+            transcript=transcript[: len(prompted_ids)],
+            transcript_lens=transcript_lens[: len(prompted_ids)],
+            max_decoder_len=max((seq.numel() - 1 for seq in prompted_ids), default=0),
+            cuts=_drop_token_ids(_drop_in_memory_data(cuts)),
+            host_audio_lens=host_audio_lens,
         )
 
     def _collate_tokens(self, tokens: list[Union[list[int], torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -240,6 +334,41 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
 
 class ProbablyIncorrectLanguageKeyError(RuntimeError):
     pass
+
+
+def _pin_tensor_fields(batch):
+    """Copy a mini-batch dataclass with every tensor field in page-locked memory.
+
+    ``DataLoader(pin_memory=True)`` pins a batch through its ``pin_memory`` method only;
+    without one the dataclass is passed on as it is, and the host-to-device copy of its audio
+    is a synchronous copy from pageable memory that stalls the training loop.
+    """
+    pinned_fields = {
+        f.name: value.pin_memory()
+        for f in dataclasses.fields(batch)
+        if isinstance(value := getattr(batch, f.name), torch.Tensor)
+    }
+    return dataclasses.replace(batch, **pinned_fields)
+
+
+_TOKEN_ID_FIELDS = ("input_ids", "context_ids", "answer_ids", "mask")
+
+
+def _drop_token_ids(cuts: CutSet) -> CutSet:
+    """Remove the token tensors of pretokenized cuts, which the mini-batch carries collated.
+
+    A batch leaves the dataloader worker by pickling, and every tensor in it crosses the process boundary on a
+    file descriptor of its own: three per cut would exhaust the default limit of 1024 descriptors on batches of
+    a few hundred cuts. ``cuts`` are copies (see ``_drop_in_memory_data``), so the cuts of the sampler keep theirs.
+    """
+    for cut in cuts:
+        custom_fields = getattr(cut, "custom", None)
+        if custom_fields and any(key in custom_fields for key in _TOKEN_ID_FIELDS):
+            cut.custom = {k: v for k, v in custom_fields.items() if k not in _TOKEN_ID_FIELDS}
+        for key in _TOKEN_ID_FIELDS:
+            if key in cut.__dict__:
+                delattr(cut, key)
+    return cuts
 
 
 def _drop_in_memory_data(

@@ -27,6 +27,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
 
 from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
+    PackedPromptedAudioToTextMiniBatch,
     PromptedAudioToTextLhotseDataset,
     PromptedAudioToTextMiniBatch,
 )
@@ -40,8 +41,10 @@ from nemo.collections.asr.parts.mixins.transcription import (
     InternalTranscribeConfig,
     TranscribeConfig,
 )
+from nemo.collections.asr.parts.packed_sequence import PackedEncoderActivations
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.multitask_decoding import MultiTaskDecoding, MultiTaskDecodingConfig
+from nemo.collections.asr.parts.submodules.packed_attention import PackedAttentionContext
 from nemo.collections.asr.parts.submodules.token_classifier import TokenClassifier
 from nemo.collections.asr.parts.utils.chunking_utils import merge_all_hypotheses, merge_parallel_chunks
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
@@ -661,6 +664,12 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             # Adding this to support processing audio files of arbitrary length by chunking them into hour-long segments.
             config.cut_into_windows_duration = 3600
             config.cut_into_windows_hop = 3600
+        # pack_sequences configures the dataset, not the Lhotse dataloader (which would log it as an ignored key);
+        # the copy without it is resolved while the config is still attached to the model config
+        pack_sequences = config.get("pack_sequences", False)
+        if "pack_sequences" in config:
+            config = OmegaConf.to_container(config, resolve=True) if isinstance(config, DictConfig) else dict(config)
+            del config["pack_sequences"]
         return get_lhotse_dataloader_from_config(
             config,
             global_rank=global_rank,
@@ -669,12 +678,15 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 tokenizer=self.tokenizer,
                 prompt=self.prompt,
                 enable_chunking=enable_chunking,  # <-- enables chunking
+                # token-flat batches for the sequence-packed teacher forcing of training_step
+                pack_sequences=pack_sequences,
             ),
             tokenizer=self.tokenizer,
         )
 
     def setup_training_data(self, train_data_config: Optional[DictConfig]):
 
+        self._check_packed_training_config(train_data_config)
         # create audio-only data loader
         self._update_dataset_config(dataset_name='train', config=train_data_config)
         self._train_dl = self._setup_dataloader_from_config(config=train_data_config)
@@ -710,6 +722,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         """
         if 'shuffle' not in val_data_config:
             val_data_config['shuffle'] = False
+        _refuse_sequence_packing(val_data_config, "validation_ds")
 
         # preserve config
         self._update_dataset_config(dataset_name='validation', config=val_data_config)
@@ -726,10 +739,32 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         """
         if 'shuffle' not in test_data_config:
             test_data_config['shuffle'] = False
+        _refuse_sequence_packing(test_data_config, "test_ds")
 
         # preserve config
         self._update_dataset_config(dataset_name='test', config=test_data_config)
         self._test_dl = self._setup_dataloader_from_config(config=test_data_config)
+
+    def _check_packed_training_config(self, train_data_config: Optional[DictConfig]):
+        """Refuse, before any data is read, the settings that the sequence-packed training step does not support.
+
+        ``train_ds.pack_sequences`` makes ``training_step`` run ``_training_step_packed`` on sequence-packed batches.
+        """
+        if not train_data_config or not train_data_config.get("pack_sequences", False):
+            return
+        transf_encoder = self.cfg.get("transf_encoder")
+        if transf_encoder is not None and transf_encoder.get("num_layers", 0) > 0:
+            raise ValueError("train_ds.pack_sequences: the Transformer encoder (transf_encoder) has no packed form.")
+        if self.cfg.loss.get("predict_last_k", 0):
+            raise ValueError(
+                "train_ds.pack_sequences: loss.predict_last_k would keep the last tokens of the whole packed batch, "
+                "not of each utterance. Set loss.predict_last_k to 0."
+            )
+        if self.cfg.get("train_batch_metrics", True):
+            raise ValueError(
+                "train_ds.pack_sequences: the sequence-packed training step does not decode its batch, so it logs no "
+                "training_batch metrics. Set train_batch_metrics: false."
+            )
 
     @property
     def input_types(self) -> Optional[Dict[str, NeuralType]]:
@@ -844,10 +879,50 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         return transf_log_probs, encoded_len, enc_states, enc_mask, encoded
 
+    def forward_sequence_packed(
+        self, batch: PackedPromptedAudioToTextMiniBatch
+    ) -> tuple[torch.Tensor, PackedAttentionContext, PackedEncoderActivations]:
+        """Run the teacher-forced forward over a sequence-packed batch without computing a padded frame or token.
+
+        The training-time counterpart of ``forward`` for ``PackedPromptedAudioToTextMiniBatch``:
+        the preprocessor, SpecAugment, the encoder and the decoder run their sequence-packed forms
+        (see ``ConformerEncoder.forward_sequence_packed`` and ``TransformerDecoderNM.forward_packed``).
+
+        Returns:
+            The log-probabilities of the decoder targets, shape ``(U_total, V)``,
+            the packing metadata of the decoder tokens, and the packed encoder output.
+        """
+        if self.use_transf_encoder:
+            raise NotImplementedError("The Transformer encoder between encoder and decoder has no packed form.")
+        # the sample counts on the host size the frontend, which carries them on (as frame counts) to the encoder
+        features = self.preprocessor.forward_packed(
+            batch.audio, batch.audio_lens, batch.audio_cu_seqlens, host_length=batch.host_audio_lens
+        )
+        if self.spec_augmentation is not None and self.training:
+            features = self.spec_augmentation.forward_packed(features)
+        encoded = self.encoder.forward_sequence_packed(features)
+        enc_states = self.encoder_decoder_proj(encoded.data)
+        # the cross-attention reads only the utterance boundaries of the encoder output
+        encoder_context = PackedAttentionContext(encoded, rel_pos_kernel=False)
+        # the token count and the longest sequence are known on the host: no device read
+        decoder_context = PackedAttentionContext.from_lengths(
+            batch.prompted_transcript_lens - 1,
+            total_tokens=batch.decoder_input_ids.shape[0],
+            max_seqlen=batch.max_decoder_len,
+        )
+        dec_states = self.transf_decoder.forward_packed(
+            batch.decoder_input_ids, decoder_context, enc_states, encoder_context
+        )
+        # the head is type-checked for (B, T, D) input
+        log_probs = self.log_softmax(hidden_states=dec_states.unsqueeze(0)).squeeze(0)
+        return log_probs, decoder_context, encoded
+
     # PTL-specific methods
-    def training_step(self, batch: PromptedAudioToTextMiniBatch, batch_nb):
+    def training_step(self, batch: PromptedAudioToTextMiniBatch | PackedPromptedAudioToTextMiniBatch, batch_nb):
         if batch is None:
             return torch.tensor([0.0])
+        if isinstance(batch, PackedPromptedAudioToTextMiniBatch):
+            return self._training_step_packed(batch)
 
         input_ids, labels = batch.get_decoder_inputs_outputs()
         input_ids_lens = batch.prompted_transcript_lens - 1
@@ -889,6 +964,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             log_every_n_steps = self._trainer.log_every_n_steps
         else:
             log_every_n_steps = 1
+        # decoding a training batch costs a greedy search; train_batch_metrics: false skips it
         metric_dict = (
             self.metric.eval(
                 batch=batch,
@@ -897,7 +973,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 predictions_mask=enc_mask,
                 prefix="training_batch",
             )
-            if (batch_nb + 1) % log_every_n_steps == 0
+            if (batch_nb + 1) % log_every_n_steps == 0 and self.cfg.get("train_batch_metrics", True)
             else {}
         )
 
@@ -913,6 +989,39 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 'output_to_padding_ratio': num_tokens / tot_tokens,
             }
         )
+        return {"loss": loss, "log": metric_dict}
+
+    def _training_step_packed(self, batch: PackedPromptedAudioToTextMiniBatch):
+        log_probs, decoder_context, encoded = self.forward_sequence_packed(batch)
+        if self.cfg.get("use_loss_mask_for_prompt", False):
+            # the target at position p of a sequence is token p + 1 of its prompted transcript,
+            # a transcript token from p = prompt_len - 1 on (the mask of the padded training_step)
+            loss_mask = decoder_context.position_ids >= (batch.prompt_lens - 1)[decoder_context.sequence_ids]
+        else:
+            loss_mask = batch.decoder_targets != self.tokenizer.pad_id
+        transf_loss = self.loss(
+            log_probs=log_probs.unsqueeze(0),
+            labels=batch.decoder_targets.unsqueeze(0),
+            output_mask=loss_mask.unsqueeze(0),
+        )
+        loss, metric_dict = transf_loss, {}
+        if self.ctc_loss_weight > 0:
+            ctc_loss = self.ctc_loss.forward_packed(
+                self.ctc_decoder.forward_packed(encoded),
+                targets=batch.transcript,
+                target_lengths=batch.transcript_lens,
+                # the transcripts are padded to the longest one, so no target is longer than their width
+                check_lengths=False,
+            )
+            loss = (1 - self.ctc_loss_weight) * transf_loss + self.ctc_loss_weight * ctc_loss
+            metric_dict = {'train_ctc_loss': ctc_loss, 'train_attn_loss': transf_loss}
+        metric_dict |= {
+            'train_loss': loss,
+            'learning_rate': torch.as_tensor(self._optimizer.param_groups[0]['lr']),
+            'batch_size': torch.as_tensor(batch.audio_lens.shape[0]),
+            'num_frames': batch.audio_lens.sum().float(),
+            'num_tokens': batch.prompted_transcript_lens.sum().float(),
+        }
         return {"loss": loss, "log": metric_dict}
 
     def validation_pass(self, batch: PromptedAudioToTextMiniBatch, batch_idx, dataloader_idx=0, eval_mode="val"):
@@ -1556,3 +1665,12 @@ def _check_aux_ctc_config(aux_ctc_config) -> None:
         )
     if not isinstance(aux_ctc_config.get("zero_infinity", False), bool):
         raise ValueError(f"aux_ctc.zero_infinity must be a bool, got {aux_ctc_config.get('zero_infinity')!r}.")
+
+
+def _refuse_sequence_packing(config, name: str):
+    """Raise if an evaluation dataset config asks for sequence packing, which only ``training_step`` handles."""
+    if config.get("pack_sequences", False):
+        raise ValueError(
+            f"{name}.pack_sequences: only the training step runs on sequence-packed batches; "
+            "evaluation needs padded batches. Remove pack_sequences from this config."
+        )

@@ -32,9 +32,7 @@ from lhotse.audio import AudioLoadingError
 from lhotse.custom import CustomFieldMixin
 from lhotse.cut import Cut
 from lhotse.dataset import AudioSamples
-from lhotse.dataset.collation import read_audio_from_cuts
 from lhotse.dataset.dataloading import resolve_seed
-from lhotse.dataset.input_strategies import _get_executor
 from lhotse.serialization import load_jsonl, open_best
 from lhotse.shar import AudioTarWriter, JsonlShardWriter
 from lhotse.utils import Pathlike, compute_num_samples, fastcopy, is_valid_url
@@ -45,6 +43,7 @@ from nemo.collections.common.data.lhotse._compat import (
     attach_graph_origin,
     normalize_graph_token,
 )
+from nemo.collections.common.data.lhotse.audio_loading import read_unpadded_audio_rows
 from nemo.collections.common.data.lhotse.audio_path_resolver import AudioPathPrefixMap
 from nemo.collections.common.data.lhotse.indexed_adapters import (
     IndexedTarMemberReader,
@@ -1175,7 +1174,7 @@ def collate_conversation_audio_packed_fault_tolerant(
             CutSet(list(conversations)),
         )
 
-    audio_rows, surviving = _read_unpadded_audio_rows(CutSet(flat_cuts), load_audio)
+    audio_rows, surviving = read_unpadded_audio_rows(CutSet(flat_cuts), load_audio)
     survivor_rows = {cut.id: row for row, cut in enumerate(surviving)}
     keep_rows, ok = _conversation_audio_survivor_rows(conversations, conversation_cut_ids, survivor_rows)
     if not ok:
@@ -3251,25 +3250,3 @@ def _conversation_audio_survivor_rows(conversations, conversation_cut_ids, survi
         else:
             logging.warning(f"Skipping conversation because it failed to load audio: {conversation.id=}")
     return keep_rows, ok
-
-
-def _read_unpadded_audio_rows(cuts: CutSet, load_audio: AudioSamples):
-    if load_audio.use_batch_loader and load_audio.ais_batch_loader is not None:
-        cuts = load_audio.ais_batch_loader(cuts)
-    executor = _get_executor(load_audio.num_workers, executor_type=load_audio._executor_type)
-    audios, surviving = read_audio_from_cuts(
-        cuts,
-        executor=executor,
-        suppress_errors=load_audio.fault_tolerant,
-    )
-    rows = [torch.as_tensor(audio) for audio in audios]
-    mono_downmix = load_audio.mono_downmix
-    if mono_downmix is None:
-        mono_downmix = not rows or not all(row.ndim == 2 for row in rows)
-    if not mono_downmix:
-        raise ValueError("Packed conversation audio requires mono_downmix=True.")
-    rows = [row.mean(dim=0) if row.ndim == 2 else row for row in rows]
-    if any(row.ndim != 1 for row in rows):
-        shapes = [tuple(row.shape) for row in rows]
-        raise ValueError(f"Packed conversation audio requires one-dimensional waveforms, got {shapes}.")
-    return [row.to(torch.float32) for row in rows], surviving

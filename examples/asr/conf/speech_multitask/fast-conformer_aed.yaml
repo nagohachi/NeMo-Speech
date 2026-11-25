@@ -37,6 +37,10 @@ model:
   label_smoothing: 0.0
   use_loss_mask_for_prompt: false
   log_prediction: true # enables logging sample predictions in the output during training
+  # greedy-decodes a training batch every log interval for the training_batch metrics;
+  # set it to false with train_ds.pack_sequences, whose training step does not decode
+  train_batch_metrics: true
+
   # Auxiliary CTC loss on the encoder output (hybrid CTC/attention training):
   # loss = (1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss.
   # ctc_reduction mean_volume (the default) divides the CTC loss by the number of target tokens, like the attention loss.
@@ -89,6 +93,10 @@ model:
     shuffle_buffer_size: 10000
     text_field: "text"
     lang_field: "target_lang"
+    # Sequence packing for training: token-flat batches without padding. Replace the bucketing options above with
+    # use_bucketing: false, batch_duration: null, use_packed_sequence_sampling: true and a batch_tokens budget, and set
+    # model.train_batch_metrics: false. Evaluation datasets do not accept it.
+    # pack_sequences: true
 
 
   validation_ds:
