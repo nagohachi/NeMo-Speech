@@ -110,6 +110,32 @@ Follow these when writing code; reviews enforce them. The full rubric is
   global RNG.
 - **Optional dependencies never break `import nemo`.** Import them locally behind `is_module_available`.
 
+### Naming
+
+Reviews enforce these rules on new and changed code. Existing NeMo names that callers already use (config keys,
+public functions and classes) keep their names.
+
+- Function and method names start with a verb (`build_packed_batch`, `get_slot_layout`, `calc_output_lengths`),
+  not a noun phrase (`packed_batch`, `output_lengths`). Use the verb that the surrounding code already uses for the
+  same kind of action. The exceptions are `@property` methods, dunder methods, and methods that keep the name of
+  the PyTorch or Lightning method they implement (`forward`, `to`, `training_step`). A pytest fixture function also
+  starts with a verb; tests use the name given with `@pytest.fixture(name=...)`.
+- A function's docstring starts with a verb that says what the function does (`Build ...`, `Return ...`,
+  `Check that ...` for a test), not with a noun phrase for its result. `@property` docstrings are noun phrases.
+- Names say what a module, function or variable holds. Do not use names that need context to read, such as `ours`
+  and `theirs` for the two sides of a comparison; name the role instead (`reference_grads`, `packed_grads`).
+- A variable's name is a noun phrase for the value it holds (`valid_frame_mask`, `padded_audio`), not an adjective
+  or a condition that the value meets (`long_enough`). A list or tensor of numbers is not named as one number
+  (`utterance_lengths`, not `num_frames`, for the lengths of all utterances).
+- A variable that holds a config or a model says so in its name (`encoder_config`, `decoder_model`), not
+  `encoder`, which reads as the module itself.
+- A name for a number of things reads as a number. Add `num_` or `_per_` where the name would otherwise read as
+  the things themselves (`num_encoder_frames`, `frames_per_chunk`). A name that already reads as a number takes no
+  `num_`: one that ends in a word for an amount (`length`, `size`, `dim`, `count`) or one that bounds a number
+  (`max_frames`).
+- Encoder outputs are frames (`num_encoder_frames`), not tokens; tokens are the positions of the decoder's text
+  sequence. Existing settings that call frames tokens, such as Lhotse's `batch_tokens`, keep their names.
+
 ## Documentation
 
 Sphinx-based docs live in `docs/source/`. Build with:
