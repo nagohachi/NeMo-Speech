@@ -670,7 +670,7 @@ class ConvSubsampling(torch.nn.Module):
         outputs = []
         lengths = []
         host_out_lengths = []
-        for first, last in self._packed_sequence_groups(layout, slot_lengths):
+        for first, last in self._packed_sequence_groups(layout):
             start, end = cu_seqlens[first], cu_seqlens[last]
             data, out_lengths, host_out = self._forward_packed_group(
                 packed.data[start:end],
@@ -729,12 +729,12 @@ class ConvSubsampling(torch.nn.Module):
                 )
             gap = -(-(gap + kernel - left - right - stride) // stride)
 
-    def _packed_sequence_groups(self, layout: PackedSlotLayout, slot_lengths: list[int]) -> list[tuple[int, int]]:
+    def _packed_sequence_groups(self, layout: PackedSlotLayout) -> list[tuple[int, int]]:
         """Split the utterances into groups whose convolution activations stay below the indexing limit.
 
         The padded forward splits the batch for the same reason (``subsampling_conv_chunking_factor``);
         here a group is a run of utterances, and a group boundary is exact because the slots are independent.
-        ``slot_lengths`` is the host copy of ``layout.slot_lengths``, a list.
+        The slot lengths are read from ``layout.host_slot_lengths``, which ``forward_packed`` always provides.
         """
         batch_size = layout.slot_lengths.numel()
         if batch_size == 0:
@@ -755,7 +755,7 @@ class ConvSubsampling(torch.nn.Module):
         groups = []
         first = 0
         current = 0
-        for index, slots in enumerate(slot_lengths):
+        for index, slots in enumerate(layout.host_slot_lengths.tolist()):
             if current and current + slots > slot_limit:
                 groups.append((first, index))
                 first, current = index, 0

@@ -802,9 +802,9 @@ def _dither_and_preemphasize_packed(x, cu_seqlens, preemph, dither):
     # the first sample of every utterance keeps its value; the offset of an empty utterance is the first sample
     # of the next one, or the end of the data, so marking every offset needs no device read to drop the empty ones
     # (index_fill_ takes the value as a kernel argument: an assignment would copy it to the device and wait for it)
-    is_start = torch.zeros(samples.numel() + 1, dtype=torch.bool, device=samples.device)
-    is_start.index_fill_(0, cu_seqlens[:-1], True)
-    return torch.where(is_start[:-1], samples, emphasized)
+    start_mask = torch.zeros(samples.numel() + 1, dtype=torch.bool, device=samples.device)
+    start_mask.index_fill_(0, cu_seqlens[:-1], True)
+    return torch.where(start_mask[:-1], samples, emphasized)
 
 
 def _dither_and_preemphasize_exact_pad_blocks(guarded, lengths, block_lengths, block_offsets, preemph, dither):

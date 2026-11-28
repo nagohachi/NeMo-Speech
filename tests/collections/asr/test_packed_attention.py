@@ -203,13 +203,17 @@ def _dense_window_attention(q, k, v, lengths, key_window, rel_pos_bias=None):
 
 @pytest.mark.unit
 def test_sequence_slices_from_host_lengths():
-    """Check that the reference path slices the utterances from the host lengths when the activations carry them."""
-    packed = pack_encoder_output(torch.randn(3, 5, 2), torch.tensor([5, 0, 3]))
-    without = PackedEncoderActivations.from_validated(
-        packed.data, packed.lengths, packed.cu_seqlens, packed.max_seqlen
+    """Check that the reference path slices the utterances from the host lengths when the activations carry them,
+    with device boundaries that differ from the host lengths so that the two sources give different slices."""
+    data = torch.randn(8, 2)
+    lengths = torch.tensor([5, 0, 3])
+    shifted_cu_seqlens = torch.tensor([0, 4, 4, 8], dtype=torch.int32)
+    with_host_lengths = PackedEncoderActivations.from_validated(
+        data, lengths, shifted_cu_seqlens, 5, host_lengths=lengths.clone()
     )
-    assert PackedAttentionContext(packed).sequence_slices == ((0, 5), (5, 5), (5, 8))
-    assert PackedAttentionContext(without).sequence_slices == ((0, 5), (5, 5), (5, 8))
+    without_host_lengths = PackedEncoderActivations.from_validated(data, lengths, shifted_cu_seqlens, 5)
+    assert PackedAttentionContext(with_host_lengths).sequence_slices == ((0, 5), (5, 5), (5, 8))
+    assert PackedAttentionContext(without_host_lengths).sequence_slices == ((0, 4), (4, 4), (4, 8))
 
 
 @pytest.mark.unit
