@@ -20,6 +20,8 @@ from functools import lru_cache
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from nemo.core.utils.optional_libs import is_lib_available
+from nemo.utils import logging
 
 _flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
 
@@ -131,47 +133,49 @@ def _get_flash_attention_varlen_for_device(device):
     return _get_flash_attention_varlen()
 
 
-@lru_cache(maxsize=1)
 def _get_flash_attention_varlen():
-    """Resolve the external or ATen variable-length FlashAttention implementation."""
-    try:
-        from flash_attn import flash_attn_varlen_func
-    except (ImportError, ModuleNotFoundError):
-        flash_forward = getattr(torch.ops.aten, "_flash_attention_forward", None)
-        if flash_forward is None:
-            return None
+    """Return the external or ATen variable-length FlashAttention implementation, or ``None`` without one."""
+    # torch.compile traces this lookup inside compiled packed layers and cannot trace an import that fails, so
+    # flash-attn is imported only when find_spec found it at module import (_FLASH_ATTN_INSTALLED)
+    if _FLASH_ATTN_INSTALLED:
+        flash_attn_varlen_func = _import_flash_attn_varlen()
+        if flash_attn_varlen_func is not None:
+            return flash_attn_varlen_func
+    if getattr(torch.ops.aten, "_flash_attention_forward", None) is None:
+        return None
+    return _run_torch_flash_attention_varlen
 
-        def torch_flash_attention_varlen(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            *,
-            dropout_p,
-            softmax_scale,
-            causal,
-        ):
-            """Adapt the ATen FlashAttention operator to the external provider signature."""
-            return flash_forward(
-                q,
-                k,
-                v,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                dropout_p,
-                causal,
-                False,
-                scale=softmax_scale,
-            )[0]
 
-        torch_flash_attention_varlen._sequence_packed_provider = "aten"
-        return torch_flash_attention_varlen
-    return flash_attn_varlen_func
+def _run_torch_flash_attention_varlen(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    *,
+    dropout_p,
+    softmax_scale,
+    causal,
+):
+    """Adapt the ATen FlashAttention operator to the external provider signature."""
+    return torch.ops.aten._flash_attention_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        causal,
+        False,
+        scale=softmax_scale,
+    )[0]
+
+
+_run_torch_flash_attention_varlen._sequence_packed_provider = "aten"
 
 
 def _forward_sequence_packed_layer(layer, x, **kwargs):
@@ -186,3 +190,19 @@ def _forward_sequence_packed_layer(layer, x, **kwargs):
             f"Activation-checkpoint wrapper around {type(wrapped).__name__} cannot execute sequence-packed layers."
         )
     return checkpoint_fn(packed_forward, x, **kwargs)
+
+
+@lru_cache(maxsize=1)
+def _import_flash_attn_varlen():
+    """Import ``flash_attn_varlen_func`` from flash-attn, or return ``None`` when the import raises ImportError."""
+    try:
+        from flash_attn import flash_attn_varlen_func
+    except ImportError as error:  # other errors of a broken build (OSError, RuntimeError) propagate
+        logging.warning(f"flash-attn is installed but cannot be imported ({error}); using the ATen FlashAttention.")
+        return None
+    return flash_attn_varlen_func
+
+
+# Whether flash-attn is installed, found with find_spec without importing it: the import loads a CUDA extension,
+# which importing this module should not pay for, and is left to the first lookup (_import_flash_attn_varlen)
+_FLASH_ATTN_INSTALLED = is_lib_available("flash_attn")
