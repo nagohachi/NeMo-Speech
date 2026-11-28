@@ -20,6 +20,7 @@ import pytest
 import soundfile
 import torch
 from lhotse import AudioSource, CutSet, MonoCut, Recording
+from lhotse.audio.utils import AudioLoadingError
 from lhotse.dataset import AudioSamples
 
 from nemo.collections.common.data.lhotse.audio_loading import read_unpadded_audio_rows
@@ -50,7 +51,7 @@ def test_rows_keep_the_order_of_the_cuts_that_load_without_the_unreadable_ones(t
 def test_rows_raise_for_an_unreadable_cut_without_fault_tolerance(tmp_path):
     """Check that strict loading raises for a cut whose file is missing instead of dropping it."""
     cuts = CutSet([_make_recording(tmp_path / "missing.wav", num_samples=8000).to_cut()])
-    with pytest.raises(Exception):
+    with pytest.raises(AudioLoadingError, match="missing.wav"):
         read_unpadded_audio_rows(cuts, AudioSamples(fault_tolerant=False))
 
 
