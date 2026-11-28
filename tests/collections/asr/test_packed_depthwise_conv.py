@@ -21,6 +21,7 @@ from torch._dynamo.testing import CompileCounterWithBackend
 from nemo.collections.asr.parts.packed_sequence import pack_encoder_output, packed_slot_layout
 from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
 from nemo.core.utils.optional_libs import TRITON_AVAILABLE
+from tests.collections.asr.numerics_test_utils import calc_rel_error
 
 CUDA_TRITON_AVAILABLE = torch.cuda.is_available() and TRITON_AVAILABLE
 
@@ -77,7 +78,7 @@ def test_bf16_autocast_error_at_most_that_of_the_gapped_convolution(num_channels
     assert grads[1].dtype == grads[2].dtype == torch.float32
     pairs = [(out, gapped, expected)] + list(zip(grads, gapped_grads, expected_grads, strict=True))
     for actual, generic, reference in pairs:
-        error, generic_error = _calc_rel_error(actual, reference), _calc_rel_error(generic, reference)
+        error, generic_error = calc_rel_error(actual, reference), calc_rel_error(generic, reference)
         assert error <= 1.1 * generic_error + 1e-6, (error, generic_error)
 
 
@@ -189,11 +190,6 @@ def _calc_grads(out, x, conv, grad):
     return [g.detach() for g in torch.autograd.grad(out, inputs, grad.to(out.dtype))]
 
 
-def _calc_rel_error(actual, reference):
-    """Return the norm of ``actual - reference`` relative to the norm of ``reference``."""
-    return float((actual.double() - reference).norm() / reference.norm().clamp(min=1e-30))
-
-
 def _assert_close(actual, expected, rtol):
     # relative to the tensor's scale: sums of many terms of both signs make elementwise tolerances meaningless
-    assert _calc_rel_error(actual, expected) <= rtol
+    assert calc_rel_error(actual, expected) <= rtol

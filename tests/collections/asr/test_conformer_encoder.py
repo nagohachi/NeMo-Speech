@@ -55,8 +55,8 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
 from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 from nemo.core.utils.optional_libs import TRITON_AVAILABLE
+from tests.collections.asr.numerics_test_utils import calc_rel_error
 from tests.collections.asr.packed_compile_test_utils import clear_packed_compile_caches
-from tests.collections.asr.test_packed_depthwise_conv import _calc_rel_error
 
 
 class TestStochasticDepth:
@@ -675,9 +675,9 @@ class TestPackedConformerConvolution:
         assert calls
         # the float32 sums of the pointwise convolutions and the normalization reach 1.1e-5 (kernel size 4);
         # the depthwise kernel alone is held to 1e-5 in test_packed_depthwise_conv.py
-        assert _calc_rel_error(outputs["cuda"], outputs["cpu"]) < 1e-4
+        assert calc_rel_error(outputs["cuda"], outputs["cpu"]) < 1e-4
         for actual, expected in zip(grads["cuda"], grads["cpu"], strict=True):
-            assert _calc_rel_error(actual, expected) < 1e-4
+            assert calc_rel_error(actual, expected) < 1e-4
 
 
 class TestPackedConformerEncoder:

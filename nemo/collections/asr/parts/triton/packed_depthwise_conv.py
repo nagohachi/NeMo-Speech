@@ -201,7 +201,7 @@ def _make_weight_grad_configs():
     ]
 
 
-@triton.autotune(configs=_make_row_configs(), key=["num_channels"])
+@triton.autotune(configs=_make_row_configs(), key=["num_channels", "KERNEL", "SIGN", "HAS_BIAS"])
 @triton.jit
 def _sum_shifted_rows_kernel(
     src_ptr,
@@ -247,7 +247,7 @@ def _sum_shifted_rows_kernel(
     )
 
 
-@triton.autotune(configs=_make_weight_grad_configs(), key=["num_channels"])
+@triton.autotune(configs=_make_weight_grad_configs(), key=["num_channels", "KERNEL"])
 @triton.jit
 def _sum_weight_grad_kernel(
     x_ptr,
