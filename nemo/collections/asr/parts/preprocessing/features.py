@@ -576,15 +576,15 @@ class FilterbankFeatures(nn.Module):
         guarded = self._get_packed_function(_guard_packed_waveforms)(
             x,
             noise,
-            seq_len,
-            cu_seqlens,
-            block_lengths,
-            block_offsets,
-            guarded_size,
-            pad_left,
-            self.preemph,
-            dither,
-            self.stft_pad_amount is not None,
+            lengths=seq_len,
+            cu_seqlens=cu_seqlens,
+            block_lengths=block_lengths,
+            block_offsets=block_offsets,
+            guarded_size=guarded_size,
+            pad_left=pad_left,
+            preemph=self.preemph,
+            dither=dither,
+            exact_pad=self.stft_pad_amount is not None,
         )
 
         with torch.amp.autocast(x.device.type, enabled=False):
@@ -604,14 +604,14 @@ class FilterbankFeatures(nn.Module):
         # the compiled function takes the real view: complex tensors are not supported by the compiler
         spectra, frame_sequence_ids = self._get_packed_function(_calc_packed_power_spectra)(
             torch.view_as_real(spectra),
-            feature_lengths,
-            block_offsets,
-            total_frames,
-            self.hop_length,
-            0 if not self.use_grads else CONSTANT,
-            narrowband,
-            self._nb_max_fft_bin if narrowband is not None else 0,
-            self.mag_power,
+            lengths=feature_lengths,
+            block_offsets=block_offsets,
+            total_frames=total_frames,
+            hop_length=self.hop_length,
+            guard_value=0 if not self.use_grads else CONSTANT,
+            narrowband=narrowband,
+            nb_max_fft_bin=self._nb_max_fft_bin if narrowband is not None else 0,
+            mag_power=self.mag_power,
         )
         if linear_spec:
             return _make_packed_features(
@@ -625,15 +625,16 @@ class FilterbankFeatures(nn.Module):
 
         features = self._get_packed_function(_calc_packed_log_mel)(
             spectra,
-            self.fb,
-            feature_lengths,
-            frame_sequence_ids,
-            self.log,
-            self.log_zero_guard_type,
-            self.log_zero_guard_value_fn(spectra) if self.log else None,  # forward checks the guard only with log
-            self.log_base,
-            self.frame_splicing,
-            None if self.norm is not None else self.normalize,
+            fb=self.fb,
+            lengths=feature_lengths,
+            sequence_ids=frame_sequence_ids,
+            log=self.log,
+            log_zero_guard_type=self.log_zero_guard_type,
+            # forward evaluates the guard only with the logarithm
+            log_zero_guard_value=self.log_zero_guard_value_fn(spectra) if self.log else None,
+            log_base=self.log_base,
+            frame_splicing=self.frame_splicing,
+            normalize=None if self.norm is not None else self.normalize,
         )
         if self.norm is not None:
             features = self.norm.forward_packed(features)
