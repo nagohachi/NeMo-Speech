@@ -32,7 +32,6 @@ from torch.nn.parallel import DistributedDataParallel
 from nemo.collections.asr.models import EncDecCTCModel
 from nemo.collections.asr.modules import transformer_encoder_utils
 from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder
-from nemo.collections.asr.parts import packed_sequence as packed_sequence_module
 from nemo.collections.asr.parts.packed_sequence import (
     PackedEncoderActivations,
     pack_encoder_output,
@@ -53,6 +52,7 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
 from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 from nemo.core.utils.optional_libs import TRITON_AVAILABLE
+from tests.collections.asr.packed_compile_test_utils import clear_packed_compile_caches
 
 
 class TestStochasticDepth:
@@ -747,13 +747,13 @@ class TestPackedConformerEncoder:
         """Check that compile_packed_layers raises when the encoder is built, not at the first training step, for a
         PyTorch whose Dynamo config has no optimize_ddp to turn off."""
         monkeypatch.delattr(torch._dynamo.config, "optimize_ddp")
-        packed_sequence_module.compile_forward_packed.cache_clear()
+        clear_packed_compile_caches()
         try:
             with pytest.raises(RuntimeError, match="optimize_ddp"):
                 _packed_encoder(compile_packed_layers=True)
             _packed_encoder()  # without the option nothing is compiled or checked
         finally:
-            packed_sequence_module.compile_forward_packed.cache_clear()
+            clear_packed_compile_caches()
 
     @pytest.mark.unit
     @pytest.mark.timeout(1200)  # two spawned processes that compile the layers in two precisions
@@ -1807,7 +1807,7 @@ class TestCacheAwareTraining:
             torch.testing.assert_close(train_out[i, :, : train_len[i]], streamed, atol=1e-5, rtol=1e-5)
 
 
-class _PackedEncoderData(torch.nn.Module):
+class _PackedEncoderModule(torch.nn.Module):
     """The packed output rows of an encoder as the forward of a module, to wrap in DistributedDataParallel."""
 
     def __init__(self, encoder):
@@ -1827,9 +1827,9 @@ def _run_compiled_layers_under_ddp(rank, world_size, init_file, backend, self_at
     close to the float32 ones as the eager gradients are. The layers hold 1.5 MB of parameters, more than the first
     gradient bucket (1 MB), so Dynamo's DDP optimizer would split their graphs at a bucket boundary.
     """
-    cuda = backend == "nccl"
-    device = torch.device("cuda", rank) if cuda else torch.device("cpu")
-    if cuda:
+    uses_nccl = backend == "nccl"
+    device = torch.device("cuda", rank) if uses_nccl else torch.device("cpu")
+    if uses_nccl:
         torch.cuda.set_device(device)
         # float32 means float32: no TF32 in the matmuls and convolutions of this process
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -1838,19 +1838,30 @@ def _run_compiled_layers_under_ddp(rank, world_size, init_file, backend, self_at
     try:
         options = dict(device=device, rank=rank, self_attention_model=self_attention_model)
         reference_grads = _calc_ddp_gradients(compile_packed_layers=False, training_precision=False, **options)
-        scale = max(float(grad.abs().max()) for grad in reference_grads.values())
+        max_reference_grad = max(float(grad.abs().max()) for grad in reference_grads.values())
         compiled_grads = _calc_ddp_gradients(compile_packed_layers=True, training_precision=False, **options)
         assert compiled_grads.keys() == reference_grads.keys()
         for name, grad in reference_grads.items():
             # the gradients that are zero in exact arithmetic are rounding noise, hence a floor at the largest one
             error = float((compiled_grads[name] - grad).norm())
-            assert error <= 1e-4 * float(grad.norm()) + 1e-6 * scale, (name, error, float(grad.norm()), scale)
+            assert error <= 1e-4 * float(grad.norm()) + 1e-6 * max_reference_grad, (
+                name,
+                error,
+                float(grad.norm()),
+                max_reference_grad,
+            )
         eager_grads = _calc_ddp_gradients(compile_packed_layers=False, training_precision=True, **options)
         compiled_grads = _calc_ddp_gradients(compile_packed_layers=True, training_precision=True, **options)
         for name, grad in reference_grads.items():
             eager_error = float((eager_grads[name] - grad).norm())
             error = float((compiled_grads[name] - grad).norm())
-            assert error <= 1.5 * eager_error + 2e-4 * scale, (name, error, eager_error, float(grad.norm()), scale)
+            assert error <= 1.5 * eager_error + 2e-4 * max_reference_grad, (
+                name,
+                error,
+                eager_error,
+                float(grad.norm()),
+                max_reference_grad,
+            )
     finally:
         dist.destroy_process_group()
 
@@ -1862,7 +1873,7 @@ def _calc_ddp_gradients(*, device, rank, self_attention_model, compile_packed_la
         self_attention_model=self_attention_model, d_model=128, n_heads=4, compile_packed_layers=compile_packed_layers
     )
     model = DistributedDataParallel(
-        _PackedEncoderData(encoder.to(device).train()),
+        _PackedEncoderModule(encoder.to(device).train()),
         device_ids=[device] if device.type == "cuda" else None,
         bucket_cap_mb=1,
         static_graph=True,

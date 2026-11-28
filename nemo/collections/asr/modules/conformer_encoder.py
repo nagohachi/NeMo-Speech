@@ -1014,16 +1014,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 "compile_packed_layers cannot be combined with activation checkpointing: the layers are wrapped in "
                 "CheckpointWrapper, which the compiled packed forward does not run. Disable one of the two."
             )
+        forward_layer = compile_forward_packed() if self.compile_packed_layers else _forward_packed_module
         for lth, (drop_prob, layer) in enumerate(zip(self.layer_drop_probs, self.layers)):
             original_signal = x
-            if self.compile_packed_layers:
-                x = compile_forward_packed()(
-                    layer, x, attention_context=attention_context, conv_layout=conv_layout, pos_emb=pos_emb
-                )
-            else:
-                x = _forward_packed_module(
-                    layer, x, attention_context=attention_context, conv_layout=conv_layout, pos_emb=pos_emb
-                )
+            x = forward_layer(layer, x, attention_context=attention_context, conv_layout=conv_layout, pos_emb=pos_emb)
             # stochastic depth as in forward_internal
             if self.training and drop_prob > 0.0:
                 should_drop = torch.rand(1) < drop_prob

@@ -33,9 +33,9 @@ from nemo.collections.asr.modules.transformer.transformer_modules import (
     TransformerEmbedding,
 )
 from nemo.collections.asr.modules.transformer.transformer_utils import get_nemo_transformer
-from nemo.collections.asr.parts import packed_sequence as packed_sequence_module
 from nemo.collections.asr.parts.packed_sequence import pack_encoder_output
 from nemo.collections.asr.parts.submodules.packed_attention import PackedAttentionContext
+from tests.collections.asr.packed_compile_test_utils import clear_packed_compile_caches
 
 
 def _composed_decoder(**overrides):
@@ -465,13 +465,13 @@ class TestCompiledPackedTransformerDecoder:
         """Check that compile_packed_layers raises when the decoder is built, not at the first training step, for a
         PyTorch whose Dynamo config has no optimize_ddp to turn off."""
         monkeypatch.delattr(torch._dynamo.config, "optimize_ddp")
-        packed_sequence_module.compile_forward_packed.cache_clear()
+        clear_packed_compile_caches()
         try:
             with pytest.raises(RuntimeError, match="optimize_ddp"):
                 _composed_decoder(compile_packed_layers=True)
             _composed_decoder()  # without the option nothing is compiled or checked
         finally:
-            packed_sequence_module.compile_forward_packed.cache_clear()
+            clear_packed_compile_caches()
 
     @pytest.mark.unit
     @pytest.mark.gpu

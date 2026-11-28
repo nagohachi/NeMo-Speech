@@ -341,7 +341,9 @@ def packed_slot_layout(packed: PackedEncoderActivations, *, alignment: int = 1, 
 
 @functools.cache
 def compile_forward_packed():
-    """Return ``module.forward_packed(*args, **kwargs)`` through ``torch.compile``, compiled once for every caller.
+    """Return ``run(module, *args, **kwargs)``, which calls ``module.forward_packed`` through ``torch.compile``.
+
+    The compiled function is created once and shared by every caller.
 
     The module is an input of the compiled function, so the layers of a stack share one graph
     (Dynamo lifts their parameters as inputs), and the number of rows is dynamic, so batches of other sizes reuse it.
