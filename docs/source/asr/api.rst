@@ -168,6 +168,8 @@ The model raises at setup for the settings the packed step does not support:
 * ``loss.predict_last_k`` other than 0, which would keep the last tokens of the whole packed batch;
 * ``train_batch_metrics`` true: the packed step does not decode its batch, so set ``train_batch_metrics: false``.
 
+The packed step logs the losses, ``learning_rate``, ``batch_size``, ``num_frames`` and ``num_tokens``; its batches have no padding, so it does not log ``input_to_padding_ratio`` and ``output_to_padding_ratio``.
+
 In multi-GPU training, ``encoder.sync_max_audio_length: false`` keeps the encoder from reading the longest length across ranks back to the host at every step.
 
 .. _rnn-encoder-api:

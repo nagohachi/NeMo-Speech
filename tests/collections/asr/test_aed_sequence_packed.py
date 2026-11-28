@@ -20,8 +20,9 @@ from collections import namedtuple
 
 import pytest
 import torch
-from lhotse import CutSet
+from lhotse import AudioSource, CutSet, Recording
 from lhotse.testing.random import deterministic_rng  # noqa: F401
+from lhotse.utils import fastcopy
 from omegaconf import OmegaConf, open_dict
 from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 from torch.utils._pytree import tree_flatten
@@ -149,6 +150,27 @@ def test_packed_batch_cuts_drop_token_ids(asr_model, cuts):
     assert all(hasattr(cut, "input_ids") for cut in cuts)
     padded_batch = PromptedAudioToTextLhotseDataset(tokenizer=asr_model.tokenizer, prompt=prompt)[cuts]
     assert all(hasattr(cut, "input_ids") for cut in padded_batch.cuts)
+
+
+@pytest.mark.unit
+def test_packed_batch_drops_an_unreadable_cut_with_its_tokens(tmp_path, asr_model, cuts):
+    """Check that with fault-tolerant audio loading a cut whose audio is missing leaves the packed batch together
+    with its tokens, and the other cuts keep their audio and tokens in order."""
+    _, packed_ds = _make_datasets(asr_model)
+    first, second, third = cuts
+    unreadable = _make_unreadable_cut(second, tmp_path, text="words that only the unreadable cut has")
+    batch = packed_ds.with_fault_tolerant_audio_loading(True)[CutSet([first, unreadable, third])]
+    _assert_same_batch(batch, packed_ds[CutSet([first, third])])
+    assert [cut.id for cut in batch.cuts] == [first.id, third.id]
+
+
+@pytest.mark.unit
+def test_packed_batch_raises_when_no_audio_loads(tmp_path, asr_model, cuts):
+    """Check that a batch whose cuts all fail to load raises instead of an empty packed batch."""
+    _, packed_ds = _make_datasets(asr_model)
+    unreadable = CutSet([_make_unreadable_cut(cut, tmp_path, text=cut.supervisions[0].text) for cut in cuts])
+    with pytest.raises(ValueError, match="none of the 3 cuts"):
+        packed_ds.with_fault_tolerant_audio_loading(True)[unreadable]
 
 
 @pytest.mark.unit
@@ -580,3 +602,16 @@ def _assert_same_batch(batch, expected):
             assert torch.equal(getattr(batch, name), value), name
     assert batch.host_audio_lens == expected.host_audio_lens
     assert batch.max_decoder_len == expected.max_decoder_len
+
+
+def _make_unreadable_cut(cut, tmp_path, text):
+    """Return a copy of ``cut`` with its own id and transcript ``text`` whose recording names a missing file."""
+    recording = Recording(
+        id=f"{cut.id}-unreadable",
+        sources=[AudioSource(type="file", channels=[0], source=str(tmp_path / f"{cut.id}-missing.wav"))],
+        sampling_rate=cut.sampling_rate,
+        num_samples=cut.recording.num_samples,
+        duration=cut.recording.duration,
+    )
+    supervision = fastcopy(cut.supervisions[0], id=recording.id, recording_id=recording.id, text=text)
+    return fastcopy(cut, id=recording.id, recording=recording, supervisions=[supervision])

@@ -197,12 +197,18 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
         )
 
     def _get_packed_batch(self, cuts: CutSet) -> PackedPromptedAudioToTextMiniBatch:
+        num_cuts = len(cuts)
         rows, cuts = read_unpadded_audio_rows(cuts, self.load_audio)
+        if not rows:
+            raise ValueError(
+                f"The audio of none of the {num_cuts} cuts of the batch could be loaded: "
+                "a sequence-packed batch needs at least one utterance."
+            )
         host_audio_lens = tuple(row.numel() for row in rows)
         audio_lens = torch.tensor(host_audio_lens, dtype=torch.long)
         audio_cu_seqlens = torch.zeros(len(rows) + 1, dtype=torch.long)
         torch.cumsum(audio_lens, dim=0, out=audio_cu_seqlens[1:])
-        audio = torch.cat(rows) if rows else torch.empty(0, dtype=torch.float32)
+        audio = torch.cat(rows)
 
         prompted_ids, prompt_lens, answers = [], [], []
         for cut in cuts:
@@ -217,19 +223,18 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
             answers.append(torch.as_tensor(answer_ids, dtype=torch.long))
         if any(seq.numel() < 2 for seq in prompted_ids):
             raise ValueError("Every prompted transcript needs at least two tokens for teacher forcing.")
-        empty_ids = torch.empty(0, dtype=torch.long)
-        transcript, transcript_lens = self._collate_tokens(answers or [empty_ids])
+        transcript, transcript_lens = self._collate_tokens(answers)
         return PackedPromptedAudioToTextMiniBatch(
             audio=audio,
             audio_lens=audio_lens,
             audio_cu_seqlens=audio_cu_seqlens,
-            decoder_input_ids=torch.cat([seq[:-1] for seq in prompted_ids]) if prompted_ids else empty_ids,
-            decoder_targets=torch.cat([seq[1:] for seq in prompted_ids]) if prompted_ids else empty_ids,
+            decoder_input_ids=torch.cat([seq[:-1] for seq in prompted_ids]),
+            decoder_targets=torch.cat([seq[1:] for seq in prompted_ids]),
             prompted_transcript_lens=torch.tensor([seq.numel() for seq in prompted_ids], dtype=torch.long),
             prompt_lens=torch.tensor(prompt_lens, dtype=torch.long),
-            transcript=transcript[: len(prompted_ids)],
-            transcript_lens=transcript_lens[: len(prompted_ids)],
-            max_decoder_len=max((seq.numel() - 1 for seq in prompted_ids), default=0),
+            transcript=transcript,
+            transcript_lens=transcript_lens,
+            max_decoder_len=max(seq.numel() - 1 for seq in prompted_ids),
             cuts=_drop_token_ids(_drop_in_memory_data(cuts)),
             host_audio_lens=host_audio_lens,
         )
