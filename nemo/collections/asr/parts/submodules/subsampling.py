@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import itertools
 import math
 from collections.abc import Sequence
@@ -24,6 +25,7 @@ from torch.nn import LayerNorm
 from nemo.collections.asr.parts.packed_sequence import (
     PackedEncoderActivations,
     PackedSlotLayout,
+    compile_without_ddp_optimizer,
     lengths_to_cu_seqlens,
     packed_slot_layout,
 )
@@ -786,6 +788,10 @@ class ConvSubsampling(torch.nn.Module):
         so that the output size needs no device read.
         Returns the valid output frames, their lengths, and a CPU copy of the lengths.
         """
+        if self.conv.can_run_triton(data):
+            return self._forward_packed_group_channels_last(
+                data, lengths, host_lengths, slot_offsets, token_slots, total_slots
+            )
         x = data.new_zeros((total_slots, data.shape[1])).index_copy(0, token_slots, data)
         x = x.view(1, 1, total_slots, -1)
         current_lengths = lengths.to(torch.int64)
@@ -818,13 +824,102 @@ class ConvSubsampling(torch.nn.Module):
         x = x.squeeze(0).permute(1, 0, 2).reshape(x.shape[2], -1).index_select(0, out_slots)
         return self.out(x), current_lengths, host_current_lengths
 
+    def _forward_packed_group_channels_last(
+        self,
+        data: torch.Tensor,
+        lengths: torch.Tensor,
+        host_lengths: torch.Tensor,
+        slot_offsets: torch.Tensor,
+        token_slots: torch.Tensor,
+        total_slots: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run ``_forward_packed_group`` for the ``dw_striding`` stack with ReLU on CUDA (where the padded forward runs
+        its Triton kernels), channels-last from the first convolution on.
+
+        Without an input gradient (features from the preprocessor), the first convolution, its ReLU, the mask of
+        the utterances' slots and the first depthwise convolution run in the fused kernel of the padded forward,
+        which never writes the largest stage; with one, the first convolution runs as a matmul over the unfolded
+        patches. The other depthwise convolutions run the Triton kernel of the padded forward (``dw_conv2d``, with the
+        gradients of its input and weights) over the whole gapped axis, and the pointwise convolutions run as linear
+        layers over the channels. The masks before the depthwise convolutions are those of the generic path, so the
+        two paths compute the same function.
+        """
+        conv0 = self.conv[0]
+        x = data.new_zeros((total_slots, data.shape[1])).index_copy(0, token_slots, data).view(1, 1, total_slots, -1)
+        current_lengths, host_current_lengths, current_offsets = _advance_packed_stage(
+            conv0, lengths.to(torch.int64), host_lengths.to(torch.int64), slot_offsets
+        )
+        if data.requires_grad:
+            # the fused kernel below gives its input no gradient: the first convolution alone, as a matmul
+            x = _run_single_channel_conv_channels_last(x, conv0)
+            layers = list(self.conv)[2:]
+        else:
+            # conv0 -> ReLU -> mask -> first depthwise in the fused kernel of the padded forward, which never writes
+            # the largest stage; it masks the first stage by the slots of the utterances instead of a length
+            first_depthwise, first_pointwise = self.conv[2], self.conv[3]
+            num_stage_slots = calculate_conv_output_size(
+                total_slots, conv0.kernel_size[0], conv0.stride[0], _layer_padding(conv0)
+            )
+            stage_valid_mask = _make_valid_slot_mask(num_stage_slots, current_offsets, current_lengths).to(x.dtype)
+            x, _ = fused_conv_relu_dw(
+                x,
+                conv0.weight,
+                conv0.bias,
+                first_depthwise.weight,
+                first_depthwise.bias,
+                *_layer_padding(conv0),
+                torch.full((1,), total_slots, dtype=torch.int64, device=x.device),
+                relu_out_valid_mask=stage_valid_mask,
+            )
+            current_lengths, host_current_lengths, current_offsets = _advance_packed_stage(
+                first_depthwise, current_lengths, host_current_lengths, current_offsets
+            )
+            batch, height, width, channels = x.shape
+            x = nn.functional.linear(x.view(-1, channels), first_pointwise.weight.flatten(1), first_pointwise.bias)
+            x = x.view(batch, height, width, -1)
+            layers = list(self.conv)[5:]
+        for i in range(0, len(layers), 3):
+            depthwise, pointwise, _ = layers[i : i + 3]
+            # the ReLU of the previous stage and the mask of this depthwise input, one pass over the largest tensors
+            x = _compile_relu_mask()(x, _make_packed_stage_mask_channels_last(x, current_offsets, current_lengths))
+            whole_row_in_lengths = torch.full((1,), x.shape[1], dtype=torch.int64, device=x.device)
+            current_lengths, host_current_lengths, current_offsets = _advance_packed_stage(
+                depthwise, current_lengths, host_current_lengths, current_offsets
+            )
+            out_height = calculate_conv_output_size(
+                x.shape[1], depthwise.kernel_size[0], depthwise.stride[0], _layer_padding(depthwise)
+            )
+            whole_row_out_lengths = torch.full((1,), out_height, dtype=torch.int64, device=x.device)
+            # one row over the whole gapped axis: the kernel masks nothing inside it, the mask above does
+            x = dw_conv2d(
+                x,
+                depthwise.weight,
+                depthwise.bias,
+                depthwise.stride,
+                *_layer_padding(depthwise),
+                whole_row_in_lengths,
+                whole_row_out_lengths,
+            )
+            batch, height, width, channels = x.shape
+            x = nn.functional.linear(x.view(-1, channels), pointwise.weight.flatten(1), pointwise.bias)
+            x = x.view(batch, height, width, -1)
+        x = torch.relu(x)  # the activation of the last stage, which no depthwise convolution reads
+
+        total_out = int(host_current_lengths.sum())
+        out_sequence_ids = torch.repeat_interleave(
+            torch.arange(current_lengths.numel(), device=x.device), current_lengths, output_size=total_out
+        )
+        out_starts = torch.cumsum(current_lengths, dim=0) - current_lengths
+        out_positions = torch.arange(total_out, device=x.device) - out_starts[out_sequence_ids]
+        out_slots = current_offsets[out_sequence_ids] + out_positions
+        # the valid frames, flattened channels before frequency bins as in the padded forward
+        x = x[0].index_select(0, out_slots).transpose(1, 2).reshape(total_out, -1)
+        return self.out(x), current_lengths, host_current_lengths
+
     @staticmethod
     def _packed_stage_mask(x: torch.Tensor, slot_offsets: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         """One for the slots inside an utterance's valid frames at this stage, zero elsewhere; shape (1, 1, S, 1)."""
-        positions = torch.arange(x.shape[2], device=x.device)
-        sequence_ids = torch.bucketize(positions, slot_offsets[1:], right=True)
-        valid = positions - slot_offsets[sequence_ids] < lengths[sequence_ids]
-        return valid.to(x.dtype).view(1, 1, -1, 1)
+        return _make_valid_slot_mask(x.shape[2], slot_offsets, lengths).to(x.dtype).view(1, 1, -1, 1)
 
     def forward(self, x, lengths):
         if self._time_strides is not None:
@@ -1119,16 +1214,8 @@ class MaskedConvSequential(nn.Sequential):
         x = x.unsqueeze(1)  # (batch, 1, time, features)
         current_lengths = lengths
 
-        # Tracing and export cannot capture a Triton launch, the fused kernel returns no input
-        # gradient, and its weight gradients accumulate through atomics, so their summation order
-        # varies between runs.
-        if (
-            self.fuse_triton
-            and x.is_cuda
-            and not x.requires_grad
-            and not torch.are_deterministic_algorithms_enabled()
-            and not (torch.jit.is_tracing() or torch.compiler.is_exporting())
-        ):
+        # the fused kernel returns no input gradient
+        if self.can_run_triton(x) and not x.requires_grad:
             x, current_lengths, mask = self._forward_fused(x, current_lengths)
         else:
             x, current_lengths, mask = self._forward_torch(x, current_lengths)
@@ -1136,6 +1223,19 @@ class MaskedConvSequential(nn.Sequential):
         # Final masking
         x = apply_channel_mask(x, mask)
         return x, current_lengths.long()
+
+    def can_run_triton(self, x: torch.Tensor) -> bool:
+        """Return whether the Triton kernels of this stack can run on ``x``.
+
+        Tracing and export cannot capture a Triton launch, and the weight gradients of the kernels accumulate
+        through atomics, so their summation order varies between runs (no deterministic algorithms).
+        """
+        return (
+            self.fuse_triton
+            and x.is_cuda
+            and not torch.are_deterministic_algorithms_enabled()
+            and not (torch.jit.is_tracing() or torch.compiler.is_exporting())
+        )
 
     def _forward_torch(self, x, current_lengths):
         mask = self._create_mask(x, current_lengths.long())
@@ -1231,6 +1331,55 @@ def _layer_padding(layer):
 def _time_axis(value):
     """The time (height) entry of a per-axis layer attribute, which pooling layers may keep as one int."""
     return value[0] if isinstance(value, (tuple, list)) else value
+
+
+def _run_single_channel_conv_channels_last(x, conv):
+    """Run ``conv`` (one input channel) over ``x`` of shape (1, 1, H, W) and return it channels-last as (1, H', W', C).
+
+    The patches of the kernel are unfolded and multiplied by the weight in one matmul, whose output is channels-last
+    by construction; cuDNN returns this convolution in (1, C, H', W') for one input channel.
+    ``conv`` is the first convolution of ``dw_striding``: one input channel, no groups, no dilation.
+    """
+    out_h, out_w = (
+        calculate_conv_output_size(x.shape[axis], conv.kernel_size[i], conv.stride[i], (conv.padding[i],) * 2)
+        for i, axis in enumerate((2, 3))
+    )
+    patches = nn.functional.unfold(x, conv.kernel_size, padding=conv.padding, stride=conv.stride)
+    out = nn.functional.linear(patches[0].t(), conv.weight.flatten(1), conv.bias)
+    return out.view(1, out_h, out_w, -1)
+
+
+@functools.cache
+def _compile_relu_mask():
+    """Return ``relu(x) * mask`` through ``torch.compile`` (dynamic shapes): one kernel forward and one backward."""
+
+    def apply_relu_mask(x, mask):
+        return torch.relu(x) * mask
+
+    # inside DistributedDataParallel as the packed layers are (see compile_forward_packed); one kernel has nothing
+    # for the DDP optimizer to split
+    return compile_without_ddp_optimizer(apply_relu_mask)
+
+
+def _advance_packed_stage(layer, lengths, host_lengths, slot_offsets):
+    """Return the lengths (device and host) and slot offsets of the packed utterances after a strided layer."""
+    lengths, host_lengths = (
+        calculate_conv_output_size(value, layer.kernel_size[0], layer.stride[0], _layer_padding(layer)).to(torch.int64)
+        for value in (lengths, host_lengths)
+    )
+    return lengths, host_lengths, torch.div(slot_offsets, layer.stride[0], rounding_mode='floor')
+
+
+def _make_packed_stage_mask_channels_last(x, slot_offsets, lengths):
+    """Make the mask of a channels-last (1, S, F, C) stage: one inside the utterances' valid frames, zero elsewhere."""
+    return _make_valid_slot_mask(x.shape[1], slot_offsets, lengths).to(x.dtype).view(1, -1, 1, 1)
+
+
+def _make_valid_slot_mask(num_slots: int, slot_offsets: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Return whether each of ``num_slots`` slots lies inside the valid frames of its utterance, shape (S,)."""
+    positions = torch.arange(num_slots, device=slot_offsets.device)
+    sequence_ids = torch.bucketize(positions, slot_offsets[1:], right=True)
+    return positions - slot_offsets[sequence_ids] < lengths[sequence_ids]
 
 
 def _reads_neighbouring_frames(layer):

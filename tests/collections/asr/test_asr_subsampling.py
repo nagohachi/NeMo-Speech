@@ -577,6 +577,23 @@ class TestPackedConvSubsampling:
         assert subsampling_module._reads_neighbouring_frames(layer) is reads
 
     @pytest.mark.unit
+    def test_single_channel_conv_channels_last_matches_conv2d(self):
+        """Check that the unfolded first convolution of the channels-last packed path is the convolution,
+        channels-last."""
+        torch.manual_seed(0)
+        conv = ConvSubsampling("dw_striding", 8, 8, 12, 4).conv[0].double()
+        x = torch.randn(1, 1, 37, 8, dtype=torch.float64)
+        expected = conv(x).permute(0, 2, 3, 1)
+        torch.testing.assert_close(subsampling_module._run_single_channel_conv_channels_last(x, conv), expected)
+
+    @pytest.mark.unit
+    def test_triton_stack_does_not_run_on_cpu(self):
+        """Check that a stack built for the Triton kernels does not choose them for CPU input."""
+        stack = ConvSubsampling("dw_striding", 8, 8, 12, 4, use_triton=True).conv
+        assert stack.fuse_triton
+        assert not stack.can_run_triton(torch.zeros(1))
+
+    @pytest.mark.unit
     def test_rejects_unsupported_stacks(self):
         packed = pack_encoder_output(torch.randn(1, 10, 8), torch.tensor([10]))
         with pytest.raises(NotImplementedError):
@@ -606,3 +623,100 @@ class TestPackedConvSubsampling:
         packed = pack_encoder_output(torch.randn(1, 10, 8), torch.tensor([10]))
         with pytest.raises(NotImplementedError, match="reads beyond the 2 empty frames"):
             module.forward_packed(packed)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available() or not subsampling_module.TRITON_AVAILABLE, reason="CUDA, Triton")
+@pytest.mark.timeout(900)  # the first call compiles the ReLU and mask kernel and autotunes the depthwise kernels
+class TestPackedConvSubsamplingChannelsLast:
+    """On CUDA the packed dw_striding stack with ReLU runs channels-last: the first stage in the fused kernel of the
+    padded forward masked by the utterances' slots (or, for an input that needs a gradient, the first convolution as a
+    matmul over the unfolded patches), the other depthwise convolutions in the Triton kernel of the padded forward,
+    the ReLU and the mask of a depthwise input in one compiled kernel. It computes the function of the generic path."""
+
+    @pytest.mark.unit
+    def test_triton_stack_runs_on_cuda_only_where_the_kernels_apply(self, monkeypatch):
+        """Check that the Triton kernels are chosen for CUDA input, and not without fuse_triton, with deterministic
+        algorithms or while exporting."""
+        stack = ConvSubsampling("dw_striding", 8, 8, 12, 4, use_triton=True).conv
+        x = torch.zeros(1, device="cuda")
+        assert stack.can_run_triton(x)
+        with monkeypatch.context() as patch:
+            patch.setattr(stack, "fuse_triton", False)
+            assert not stack.can_run_triton(x)
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.compiler, "is_exporting", lambda: True)
+            assert not stack.can_run_triton(x)
+        were_deterministic_algorithms_enabled = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+        try:
+            assert not stack.can_run_triton(x)
+        finally:
+            torch.use_deterministic_algorithms(were_deterministic_algorithms_enabled)
+        assert stack.can_run_triton(x)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("input_grad", [False, True], ids=["fused_first_stage", "unfolded_first_stage"])
+    def test_matches_the_generic_path_in_float32(self, monkeypatch, input_grad):
+        # float32 in both paths: no TF32 in cuDNN's convolutions of the generic path or in the matmuls
+        monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+        module, features, lengths = _make_cuda_packed_case()
+        calls = []
+        original_forward_channels_last = subsampling_module.ConvSubsampling._forward_packed_group_channels_last
+        monkeypatch.setattr(
+            subsampling_module.ConvSubsampling,
+            "_forward_packed_group_channels_last",
+            lambda *args, **kwargs: calls.append(1) or original_forward_channels_last(*args, **kwargs),
+        )
+        (out, grads), (reference, reference_grads) = (
+            _run_packed_subsampling(module, features.requires_grad_(input_grad), lengths, channels_last=path)
+            for path in (True, False)
+        )
+        assert calls, "the channels-last path did not run"
+        # the fused first stage multiplies float32 with tl.dot, which rounds the operands to TF32 (10-bit mantissa),
+        # as in the padded forward; the unfolded first stage computes in float32
+        tolerance, floor = (1e-5, 1e-6) if input_grad else (1e-3, 1e-3)
+        torch.testing.assert_close(out, reference, rtol=tolerance, atol=tolerance * float(reference.abs().max()))
+        scale = max(float(g.abs().max()) for g in reference_grads.values())
+        for name, grad in reference_grads.items():
+            assert (grads[name] - grad).norm() <= 10 * tolerance * grad.norm() + floor * scale, name
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("input_grad", [False, True], ids=["fused_first_stage", "unfolded_first_stage"])
+    def test_bfloat16_is_as_close_to_float32_as_the_generic_path(self, monkeypatch, input_grad):
+        monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+        module, features, lengths = _make_cuda_packed_case()
+        features.requires_grad_(input_grad)
+        reference, reference_grads = _run_packed_subsampling(module, features, lengths, channels_last=False)
+        generic, generic_grads = _run_packed_subsampling(module, features, lengths, channels_last=False, bf16=True)
+        out, grads = _run_packed_subsampling(module, features, lengths, channels_last=True, bf16=True)
+        assert (out - reference).norm() <= 1.5 * (generic - reference).norm() + 1e-3 * reference.norm()
+        scale = max(float(g.abs().max()) for g in reference_grads.values())
+        for name, grad in reference_grads.items():
+            error, generic_error = (grads[name] - grad).norm(), (generic_grads[name] - grad).norm()
+            assert error <= 1.5 * generic_error + 2e-4 * scale, name
+
+
+def _make_cuda_packed_case():
+    torch.manual_seed(0)
+    module = ConvSubsampling("dw_striding", 8, 16, 24, 8).cuda().train()
+    assert module.conv.fuse_triton
+    lengths = torch.tensor([300, 77, 160, 9, 241], device="cuda")
+    features = torch.randn(len(lengths), int(lengths.max()), 16, device="cuda")
+    return module, features, lengths
+
+
+def _run_packed_subsampling(module, features, lengths, *, channels_last, bf16=False):
+    """Return the packed output and the parameter gradients of a random projection of it, on one of the two paths."""
+    module.conv.fuse_triton = channels_last
+    module.zero_grad(set_to_none=True)
+    try:
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+            out = module.forward_packed(pack_encoder_output(features, lengths)).data.float()
+        weights = torch.randn(out.shape, generator=torch.Generator().manual_seed(3)).cuda()
+        (out * weights).sum().backward()
+    finally:
+        module.conv.fuse_triton = True
+    return out.detach(), {name: p.grad.float().clone() for name, p in module.named_parameters()}
