@@ -17,6 +17,7 @@ import functools
 import inspect
 import os
 import random
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -38,7 +39,9 @@ from nemo.collections.asr.parts.packed_sequence import (
     packed_slot_layout,
     unpack_encoder_output,
 )
+from nemo.collections.asr.parts.submodules import conformer_modules as conformer_modules_module
 from nemo.collections.asr.parts.submodules import packed_attention as packed_attention_module
+from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
 from nemo.collections.asr.parts.submodules.conformer_modules import (
     ConformerConvolution,
     ConformerFeedForward,
@@ -52,6 +55,7 @@ from nemo.collections.asr.parts.submodules.multi_head_attention import (
 from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 from nemo.core.utils.optional_libs import TRITON_AVAILABLE
+from tests.collections.asr.numerics_test_utils import calc_rel_error
 from tests.collections.asr.packed_compile_test_utils import clear_packed_compile_caches
 
 
@@ -612,6 +616,85 @@ class TestPackedConformerConvolution:
         padded_out[valid].square().sum().backward()
         packed_out.square().sum().backward()
         torch.testing.assert_close(packed_in.grad[valid], padded_in.grad[valid])
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "kernel_size,stride,padding,expected",
+        [(5, 1, None, (4, 0)), (3, 2, None, (2, 1)), (5, 1, 2, (2, 2)), (4, 1, [1, 2], (1, 2))],
+        ids=["causal", "causal_strided", "symmetric", "asymmetric"],
+    )
+    def test_causal_conv1d_reports_its_padding(self, kernel_size, stride, padding, expected):
+        """Check that CausalConv1D reports the zero frames it adds before and after its input, for the causal
+        default, a stride, an integer and a [left, right] padding."""
+        conv = CausalConv1D(4, 4, kernel_size, stride=stride, padding=padding)
+        assert (conv.left_padding, conv.right_padding) == expected
+
+    @pytest.mark.unit
+    def test_packed_row_kernel_runs_only_the_depthwise_convolution_it_covers(self, monkeypatch):
+        """Check the choice of the packed row kernel: a CausalConv1D depthwise convolution of the module on CUDA
+        with Triton; the CPU, a missing Triton, another convolution class, a stride or a dilation take the gapped
+        form. A stand-in tensor carries ``is_cuda``, so the check runs without a GPU."""
+        monkeypatch.setattr(conformer_modules_module, "TRITON_AVAILABLE", True)
+        cuda_x, cpu_x = SimpleNamespace(is_cuda=True), torch.zeros(1)
+        runs_kernel = conformer_modules_module._should_run_packed_depthwise_kernel
+        depthwise = ConformerConvolution(d_model=8, kernel_size=9).depthwise_conv
+        causal_depthwise = ConformerConvolution(d_model=8, kernel_size=5, conv_context_size="causal").depthwise_conv
+        assert runs_kernel(depthwise, cuda_x) and runs_kernel(causal_depthwise, cuda_x)
+        assert not runs_kernel(depthwise, cpu_x)
+        for conv in (
+            torch.nn.Conv1d(8, 8, 9, padding=4, groups=8),
+            CausalConv1D(8, 8, 9, stride=2, padding=None, groups=8),
+            CausalConv1D(8, 8, 9, dilation=2, padding=None, groups=8),
+            CausalConv1D(8, 8, 9, padding=[4, 4], groups=1),
+        ):
+            assert not runs_kernel(conv, cuda_x), conv
+        monkeypatch.setattr(conformer_modules_module, "TRITON_AVAILABLE", False)
+        assert not runs_kernel(depthwise, cuda_x)
+
+    @pytest.mark.unit
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not (torch.cuda.is_available() and TRITON_AVAILABLE), reason="CUDA and Triton are required")
+    @pytest.mark.parametrize("kernel_size,conv_context_size", [(9, None), (4, None), (5, "causal")])
+    def test_cuda_runs_the_packed_row_kernel_and_matches_the_gapped_form(
+        self, monkeypatch, kernel_size, conv_context_size
+    ):
+        """Check float32 on CUDA against float64 on the CPU in evaluation mode: there the batch normalization passes a
+        gradient to the depthwise bias, which the batch statistics of training mode cancel (a zero to compare)."""
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+        calls = []
+        original_run_conv = conformer_modules_module.run_packed_depthwise_conv1d
+        monkeypatch.setattr(
+            conformer_modules_module,
+            "run_packed_depthwise_conv1d",
+            lambda *args: calls.append(1) or original_run_conv(*args),
+        )
+        torch.manual_seed(1)
+        module = ConformerConvolution(d_model=48, kernel_size=kernel_size, conv_context_size=conv_context_size)
+        # running statistics away from the initial zero mean and unit variance
+        module.batch_norm.running_mean.uniform_(-0.5, 0.5)
+        module.batch_norm.running_var.uniform_(0.5, 2.0)
+        reference = copy.deepcopy(module).double().eval()
+        module = module.cuda().eval()
+        lengths = torch.tensor([300, 1, 3, 77, 9])
+        padded = torch.randn(len(lengths), 300, 48, dtype=torch.float64)
+        outputs, grads = {}, {}
+        for name, conv_module, device, dtype in (
+            ("cuda", module, "cuda", torch.float32),
+            ("cpu", reference, "cpu", None),
+        ):
+            packed = pack_encoder_output(padded.to(device=device, dtype=dtype or padded.dtype), lengths.to(device))
+            data = packed.data.detach().requires_grad_()
+            out = conv_module.forward_packed(data, packed_slot_layout(packed, gap=kernel_size - 1))
+            loss_weights = torch.linspace(-1, 1, out.numel(), dtype=torch.float64).view_as(out)
+            (out * loss_weights.to(device=device, dtype=out.dtype)).sum().backward()
+            outputs[name] = out.detach().double().cpu()
+            grads[name] = [data.grad.double().cpu()] + [p.grad.double().cpu() for p in conv_module.parameters()]
+        assert calls
+        # the float32 sums of the pointwise convolutions and the normalization reach 1.1e-5 (kernel size 4);
+        # the depthwise kernel alone is held to 1e-5 in test_packed_depthwise_conv.py
+        assert calc_rel_error(outputs["cuda"], outputs["cpu"]) < 1e-4
+        for actual, expected in zip(grads["cuda"], grads["cpu"], strict=True):
+            assert calc_rel_error(actual, expected) < 1e-4
 
 
 class TestPackedConformerEncoder:
