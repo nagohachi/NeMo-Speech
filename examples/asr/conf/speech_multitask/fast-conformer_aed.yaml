@@ -37,9 +37,6 @@ model:
   label_smoothing: 0.0
   use_loss_mask_for_prompt: false
   log_prediction: true # enables logging sample predictions in the output during training
-  # read by the padded training step only: true greedy-decodes a training batch every log interval for the
-  # training_batch metrics, false skips that decoding; the sequence-packed training step never decodes
-  train_batch_metrics: true
 
   # Auxiliary CTC loss on the encoder output (hybrid CTC/attention training):
   # loss = (1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss.

@@ -390,20 +390,6 @@ def test_packed_backward_matches_padded_from_the_same_features(deterministic_rng
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("train_batch_metrics", [True, False])
-def test_train_batch_metrics_decides_the_training_batch_decoding(asr_model, cuts, train_batch_metrics):
-    with open_dict(asr_model.cfg):
-        asr_model.cfg.train_batch_metrics = train_batch_metrics
-    prefixes = []
-    asr_model.metric.eval = lambda **kwargs: prefixes.append(kwargs["prefix"]) or {}
-    padded_ds, _ = _make_datasets(asr_model)
-
-    asr_model.training_step(padded_ds[cuts], batch_nb=0)
-
-    assert prefixes == (["training_batch"] if train_batch_metrics else [])
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize("name", ["validation_ds", "test_ds"])
 def test_evaluation_data_refuses_sequence_packing(asr_model, name):
     config = OmegaConf.create({"use_lhotse": True, "pack_sequences": True})

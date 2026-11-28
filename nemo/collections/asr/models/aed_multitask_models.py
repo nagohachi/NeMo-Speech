@@ -943,7 +943,6 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             log_every_n_steps = self._trainer.log_every_n_steps
         else:
             log_every_n_steps = 1
-        # decoding a training batch costs a greedy search; train_batch_metrics: false skips it
         metric_dict = (
             self.metric.eval(
                 batch=batch,
@@ -952,7 +951,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 predictions_mask=enc_mask,
                 prefix="training_batch",
             )
-            if (batch_nb + 1) % log_every_n_steps == 0 and self.cfg.get("train_batch_metrics", True)
+            if (batch_nb + 1) % log_every_n_steps == 0
             else {}
         )
 

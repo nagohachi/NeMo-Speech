@@ -168,7 +168,7 @@ The model raises at setup for the settings the packed step does not support:
 * ``loss.predict_last_k`` other than 0, which would keep the last tokens of the whole packed batch.
 
 The packed step logs the losses, ``learning_rate``, ``batch_size``, ``num_frames`` and ``num_tokens``; its batches have no padding, so it does not log ``input_to_padding_ratio`` and ``output_to_padding_ratio``,
-and it does not decode its batch, so it logs no ``training_batch`` metrics whatever ``train_batch_metrics`` says.
+and it does not decode its batch, so it logs no ``training_batch`` metrics.
 
 In multi-GPU training, ``encoder.sync_max_audio_length: false`` keeps the encoder from reading the longest length across ranks back to the host at every step.
 
