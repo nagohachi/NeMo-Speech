@@ -19,6 +19,7 @@ import traceback
 from collections import namedtuple
 
 import pytest
+import soundfile
 import torch
 from lhotse import AudioSource, CutSet, Recording
 from lhotse.testing.random import deterministic_rng  # noqa: F401
@@ -140,7 +141,7 @@ def test_int16_audio_drops_unreadable_cuts_only_when_fault_tolerant(asr_model, c
     cuts = cuts.to_eager()
     cuts[1].recording.sources[0].source = b"not audio"
     dataset = _make_int16_dataset(asr_model)
-    with pytest.raises(Exception, match="Format not recognised"):
+    with pytest.raises(soundfile.LibsndfileError):
         dataset.with_fault_tolerant_audio_loading(False)[cuts]
     batch = dataset.with_fault_tolerant_audio_loading(True)[cuts]
     assert [cut.id for cut in batch.cuts] == [cuts[0].id, cuts[2].id]

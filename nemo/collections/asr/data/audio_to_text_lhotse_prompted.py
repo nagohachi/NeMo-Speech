@@ -120,9 +120,9 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
     Sequence packing:
     With `pack_sequences` the dataset returns a ``PackedPromptedAudioToTextMiniBatch``: the waveforms of all
     utterances in one row, without padding. With `int16_audio` as well, the waveforms stay 16-bit integers from the
-    decoder to the GPU (half the bytes to collate, pin and copy); the model's preprocessor divides them by ``INT16_AUDIO_SCALE``,
-    which gives the float32 samples of the default path bit for bit. It reads single-source mono recordings from
-    files or from memory (tarred datasets) and raises on other cuts.
+    decoder to the GPU (half the bytes to collate, pin and copy); the model's preprocessor divides them by
+    ``INT16_AUDIO_SCALE``, which gives the float32 samples of the default path bit for bit.
+    It reads single-source mono recordings from files or from memory (tarred datasets) and raises on other cuts.
 
     NOTE:
     If the environment variable `USE_AIS_GET_BATCH` is set to `true` (case-insensitive),

@@ -76,8 +76,9 @@ def read_unpadded_audio_rows(cuts: CutSet, load_audio: AudioSamples, *, dtype: t
 
     ``dtype`` float32 gives Lhotse's samples in [-1, 1). ``dtype`` int16 decodes the 16-bit integer samples
     with soundfile instead, half the bytes to collate, pin and copy to the GPU; divided by 32768
-    (``INT16_AUDIO_SCALE`` of the preprocessor that converts them) they are the float32 samples bit for bit. It reads mono 16-bit PCM recordings from a file or from memory as
-    Lhotse would (same offset, sample count and length correction) and raises on cuts it cannot read that way
+    (``INT16_AUDIO_SCALE`` of the preprocessor that converts them) they are the float32 samples bit for bit.
+    It reads mono 16-bit PCM recordings from a file or from memory as Lhotse would
+    (same offset, sample count and length correction) and raises on cuts it cannot read that way
     (several sources or channels, audio transforms, resampling, video, other source types, other sample formats),
     also when ``load_audio`` is fault-tolerant.
     """

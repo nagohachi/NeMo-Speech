@@ -682,7 +682,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 enable_chunking=enable_chunking,  # <-- enables chunking
                 # token-flat batches for the sequence-packed teacher forcing of training_step
                 pack_sequences=pack_sequences,
-                # their waveforms as int16 up to the preprocessor
+                # int16_audio: keep the packed waveforms as int16 up to the preprocessor
                 int16_audio=int16_audio,
             ),
             tokenizer=self.tokenizer,
