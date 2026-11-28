@@ -34,11 +34,12 @@ from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
     PromptedAudioToTextLhotseDataset,
 )
 from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel
+from nemo.collections.asr.modules.audio_preprocessing import INT16_AUDIO_SCALE
 from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 from nemo.collections.asr.parts.packed_sequence import pack_encoder_output
 from nemo.collections.common.data import apply_prompt_format_fn
 from nemo.collections.common.data.lhotse import dataloader as lhotse_dataloader
-from nemo.collections.common.data.lhotse.audio_loading import INT16_AUDIO_SCALE, read_unpadded_audio_rows
+from nemo.collections.common.data.lhotse.audio_loading import read_unpadded_audio_rows
 from nemo.collections.common.parts.adapter_modules import LinearAdapterConfig
 from nemo.collections.common.prompts.canary import CanaryPromptFormatter
 

@@ -32,9 +32,6 @@ from lhotse.utils import compute_num_samples
 
 from nemo.utils import logging
 
-# int16 samples divided by this are the float32 samples that soundfile reads from 16-bit PCM audio, exactly
-INT16_AUDIO_SCALE = 32768
-
 
 class LhotseAudioLoadingDatasetMixin:
     """Make a dataset's ``AudioSamples`` failure policy loader-configurable.
@@ -78,8 +75,8 @@ def read_unpadded_audio_rows(cuts: CutSet, load_audio: AudioSamples, *, dtype: t
     with a fault-tolerant ``load_audio`` the cuts that fail to load are dropped from both.
 
     ``dtype`` float32 gives Lhotse's samples in [-1, 1). ``dtype`` int16 decodes the 16-bit integer samples
-    with soundfile instead, half the bytes to collate, pin and copy to the GPU; divided by ``INT16_AUDIO_SCALE``
-    they are the float32 samples bit for bit. It reads mono 16-bit PCM recordings from a file or from memory as
+    with soundfile instead, half the bytes to collate, pin and copy to the GPU; divided by 32768
+    (``INT16_AUDIO_SCALE`` of the preprocessor that converts them) they are the float32 samples bit for bit. It reads mono 16-bit PCM recordings from a file or from memory as
     Lhotse would (same offset, sample count and length correction) and raises on cuts it cannot read that way
     (several sources or channels, audio transforms, resampling, video, other source types, other sample formats),
     also when ``load_audio`` is fault-tolerant.
@@ -142,8 +139,9 @@ def _load_int16_audio(cut, suppress_errors: bool) -> np.ndarray | None:
                     f"int16 audio rows cannot read cut {cut.id}: its audio is {audio.subtype}, not 16-bit PCM."
                 )
             if audio.samplerate != recording.sampling_rate or audio.channels != 1:
-                raise ValueError(
-                    f"int16 audio rows cannot read cut {cut.id}: the audio has {audio.channels} channels at "
+                # metadata that does not describe the file is a data error, not a failed read
+                raise _UnsupportedInt16Audio(
+                    f"int16 audio rows cannot read cut {cut.id}: the audio has {audio.channels} channel(s) at "
                     f"{audio.samplerate} Hz, the recording declares 1 channel at {recording.sampling_rate} Hz."
                 )
             if offset > 0:

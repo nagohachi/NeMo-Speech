@@ -25,7 +25,6 @@ from nemo.collections.asr.parts.packed_sequence import PackedEncoderActivations
 from nemo.collections.asr.parts.preprocessing.features import FilterbankFeatures
 from nemo.collections.asr.parts.submodules.spectr_augment import SpecAugment, SpecCutout
 from nemo.collections.audio.parts.utils.transforms import MFCC
-from nemo.collections.common.data.lhotse.audio_loading import INT16_AUDIO_SCALE
 from nemo.core.classes import Exportable, NeuralModule, typecheck
 from nemo.core.neural_types import (
     AudioSignal,
@@ -40,6 +39,10 @@ from nemo.utils import logging, logging_mode
 
 if NUMBA_CUDA_AVAILABLE:
     from nemo.collections.asr.parts.numba.spec_augment import SpecAugmentNumba, spec_augment_launch_heuristics
+
+# int16 samples divided by this are the float32 samples that soundfile reads from 16-bit PCM audio, exactly;
+# the int16_audio datasets read such samples and forward_packed converts them
+INT16_AUDIO_SCALE = 32768
 
 __all__ = [
     'AudioToMelSpectrogramPreprocessor',

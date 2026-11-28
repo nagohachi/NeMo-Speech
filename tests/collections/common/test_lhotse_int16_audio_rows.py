@@ -22,7 +22,8 @@ import torch
 from lhotse import AudioSource, CutSet, MonoCut, Recording
 from lhotse.dataset import AudioSamples
 
-from nemo.collections.common.data.lhotse.audio_loading import INT16_AUDIO_SCALE, read_unpadded_audio_rows
+from nemo.collections.asr.modules.audio_preprocessing import INT16_AUDIO_SCALE
+from nemo.collections.common.data.lhotse.audio_loading import read_unpadded_audio_rows
 
 SAMPLING_RATE = 16000
 
@@ -82,12 +83,14 @@ def test_int16_rows_refuse_audio_that_is_not_16_bit_pcm(tmp_path, subtype, fault
 
 
 @pytest.mark.unit
-def test_int16_rows_refuse_a_file_that_differs_from_its_recording(tmp_path):
-    """Check that a sampling rate that differs from the one the recording declares raises."""
+@pytest.mark.parametrize("fault_tolerant", [False, True])
+def test_int16_rows_refuse_a_file_that_differs_from_its_recording(tmp_path, fault_tolerant):
+    """Check that a sampling rate that differs from the one the recording declares raises, also when the reader
+    drops unreadable cuts."""
     path = _write_audio(tmp_path / "talk.wav", num_samples=8000)
     cut = _make_recording(path, num_samples=4000, sampling_rate=8000).to_cut()
-    with pytest.raises(ValueError, match="1 channels at 16000 Hz, the recording declares 1 channel at 8000 Hz"):
-        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(), dtype=torch.int16)
+    with pytest.raises(ValueError, match=r"1 channel\(s\) at 16000 Hz, the recording declares 1 channel at 8000 Hz"):
+        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(fault_tolerant=fault_tolerant), dtype=torch.int16)
 
 
 @pytest.mark.unit
