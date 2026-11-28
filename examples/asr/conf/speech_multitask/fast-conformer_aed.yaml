@@ -89,6 +89,10 @@ model:
     shuffle_buffer_size: 10000
     text_field: "text"
     lang_field: "target_lang"
+    # Sequence packing for training: token-flat batches without padding. Replace the bucketing options above with
+    # use_bucketing: false, batch_duration: null, use_packed_sequence_sampling: true and a batch_tokens budget.
+    # The packed training step logs no training_batch metrics. Evaluation datasets do not accept it.
+    # pack_sequences: true
 
 
   validation_ds:

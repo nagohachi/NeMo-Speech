@@ -16,6 +16,12 @@
 
 from copy import copy
 
+import torch
+from lhotse import CutSet
+from lhotse.dataset import AudioSamples
+from lhotse.dataset.collation import read_audio_from_cuts
+from lhotse.dataset.input_strategies import _get_executor
+
 
 class LhotseAudioLoadingDatasetMixin:
     """Make a dataset's ``AudioSamples`` failure policy loader-configurable.
@@ -50,3 +56,30 @@ def configure_dataset_audio_loading(dataset, enabled: bool):
     """Apply a loader-level audio policy when the dataset exposes the protocol."""
     configure = getattr(dataset, "with_fault_tolerant_audio_loading", None)
     return configure(enabled) if callable(configure) else dataset
+
+
+def read_unpadded_audio_rows(cuts: CutSet, load_audio: AudioSamples):
+    """Load the mono waveform of every cut without padded collation.
+
+    Returns the float32 waveforms, one 1D tensor per surviving cut, and the cuts that loaded;
+    with a fault-tolerant ``load_audio`` the cuts that fail to load are dropped from both.
+    """
+    if load_audio.use_batch_loader and load_audio.ais_batch_loader is not None:
+        cuts = load_audio.ais_batch_loader(cuts)
+    executor = _get_executor(load_audio.num_workers, executor_type=load_audio._executor_type)
+    audios, surviving = read_audio_from_cuts(
+        cuts,
+        executor=executor,
+        suppress_errors=load_audio.fault_tolerant,
+    )
+    rows = [torch.as_tensor(audio) for audio in audios]
+    mono_downmix = load_audio.mono_downmix
+    if mono_downmix is None:
+        mono_downmix = not rows or not all(row.ndim == 2 for row in rows)
+    if not mono_downmix:
+        raise ValueError("Unpadded audio rows require mono_downmix=True.")
+    rows = [row.mean(dim=0) if row.ndim == 2 else row for row in rows]
+    if any(row.ndim != 1 for row in rows):
+        shapes = [tuple(row.shape) for row in rows]
+        raise ValueError(f"Unpadded audio rows require one-dimensional waveforms, got {shapes}.")
+    return [row.to(torch.float32) for row in rows], surviving
