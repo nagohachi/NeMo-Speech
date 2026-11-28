@@ -204,10 +204,10 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
         prompts_with_answers, prompts, answers = self._get_prompted_token_ids(cuts)
         prompted_ids = [torch.as_tensor(ids, dtype=torch.long) for ids in prompts_with_answers]
         prompt_lens = [len(ids) for ids in prompts]
-        answers = [torch.as_tensor(ids, dtype=torch.long) for ids in answers]
+        answer_tensors = [torch.as_tensor(ids, dtype=torch.long) for ids in answers]
         if any(seq.numel() < 2 for seq in prompted_ids):
             raise ValueError("Every prompted transcript needs at least two tokens for teacher forcing.")
-        transcript, transcript_lens = self._collate_tokens(answers)
+        transcript, transcript_lens = self._collate_tokens(answer_tensors)
         return PackedPromptedAudioToTextMiniBatch(
             audio=audio,
             audio_lens=audio_lens,
