@@ -624,7 +624,7 @@ class TestPackedConformerConvolution:
         form. A stand-in tensor carries ``is_cuda``, so the check runs without a GPU."""
         monkeypatch.setattr(conformer_modules_module, "TRITON_AVAILABLE", True)
         cuda_x, cpu_x = SimpleNamespace(is_cuda=True), torch.zeros(1)
-        runs_kernel = conformer_modules_module._runs_packed_depthwise_kernel
+        runs_kernel = conformer_modules_module._should_run_packed_depthwise_kernel
         depthwise = ConformerConvolution(d_model=8, kernel_size=9).depthwise_conv
         causal_depthwise = ConformerConvolution(d_model=8, kernel_size=5, conv_context_size="causal").depthwise_conv
         assert runs_kernel(depthwise, cuda_x) and runs_kernel(causal_depthwise, cuda_x)

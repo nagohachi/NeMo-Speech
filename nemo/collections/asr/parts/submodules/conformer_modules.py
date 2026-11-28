@@ -548,7 +548,7 @@ class ConformerConvolution(nn.Module):
             for parameter in self.depthwise_conv.parameters():
                 anchor = anchor + parameter.sum().to(anchor.dtype) * 0.0
             x = x + anchor
-        elif _runs_packed_depthwise_kernel(self.depthwise_conv, x):
+        elif _should_run_packed_depthwise_kernel(self.depthwise_conv, x):
             # the same convolution on the frame rows: a tap that leaves its utterance reads zero
             conv = self.depthwise_conv
             x = run_packed_depthwise_conv1d(x, conv.weight, conv.bias, layout.token_slots, conv.left_padding)
@@ -647,7 +647,7 @@ class ConformerFeedForward(nn.Module):
                 nn.init.uniform_(self.linear2.bias, -ffn2_max, ffn2_max)
 
 
-def _runs_packed_depthwise_kernel(conv: nn.Module, x: torch.Tensor) -> bool:
+def _should_run_packed_depthwise_kernel(conv: nn.Module, x: torch.Tensor) -> bool:
     """Check whether ``ConformerConvolution.forward_packed`` runs ``conv`` with the Triton kernel of packed rows.
 
     The kernel covers the depthwise convolution the module builds (``CausalConv1D``, stride 1, no dilation,
