@@ -668,10 +668,10 @@ class TestPackedConformerEncoder:
         assert out.host_lengths.device.type == "cpu" and torch.equal(out.host_lengths, out.lengths)
         encoder = _packed_encoder(pre_encode=None, subsampling_factor=1).double().eval()
         assert torch.equal(encoder.forward_sequence_packed(features).host_lengths, lengths)
-        without = PackedEncoderActivations.from_validated(
+        without_host_lengths = PackedEncoderActivations.from_validated(
             features.data, features.lengths, features.cu_seqlens, features.max_seqlen
         )
-        assert encoder.forward_sequence_packed(without).host_lengths is None
+        assert encoder.forward_sequence_packed(without_host_lengths).host_lengths is None
 
     @pytest.mark.unit
     def test_output_padding_is_zero_whatever_the_input_padding(self):

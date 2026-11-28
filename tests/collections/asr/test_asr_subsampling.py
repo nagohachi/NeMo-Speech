@@ -511,12 +511,15 @@ class TestPackedConvSubsampling:
         module = ConvSubsampling("dw_striding", 8, 8, 12, 4).double()
         module.subsampling_conv_chunking_factor = chunking_factor
         lengths = torch.tensor([37, 1, 12, 0, 36, 6])
-        packed = pack_encoder_output(_packed_test_features(lengths), lengths)
-        without = PackedEncoderActivations.from_validated(
-            packed.data, packed.lengths, packed.cu_seqlens, packed.max_seqlen
+        with_host_lengths = pack_encoder_output(_packed_test_features(lengths), lengths)
+        without_host_lengths = PackedEncoderActivations.from_validated(
+            with_host_lengths.data,
+            with_host_lengths.lengths,
+            with_host_lengths.cu_seqlens,
+            with_host_lengths.max_seqlen,
         )
-        expected = module.forward_packed(without)
-        actual = module.forward_packed(packed)
+        expected = module.forward_packed(without_host_lengths)
+        actual = module.forward_packed(with_host_lengths)
         torch.testing.assert_close(actual.data, expected.data, rtol=0, atol=0)
         for out in (actual, expected):
             assert out.host_lengths.device.type == "cpu"

@@ -750,13 +750,13 @@ def test_public_constructor_validates_host_lengths():
 @pytest.mark.parametrize("alignment, gap", [(1, 0), (4, 2), (8, 8)])
 def test_packed_slot_layout_sizes_from_host_lengths(alignment, gap):
     """Check that host lengths give the slot layout of the device lengths without a device read."""
-    packed = pack_encoder_output(torch.randn(3, 7, 2), torch.tensor([7, 0, 3]))
-    without = PackedEncoderActivations.from_validated(
-        packed.data, packed.lengths, packed.cu_seqlens, packed.max_seqlen
+    with_host_lengths = pack_encoder_output(torch.randn(3, 7, 2), torch.tensor([7, 0, 3]))
+    without_host_lengths = PackedEncoderActivations.from_validated(
+        with_host_lengths.data, with_host_lengths.lengths, with_host_lengths.cu_seqlens, with_host_lengths.max_seqlen
     )
 
-    expected = packed_slot_layout(without, alignment=alignment, gap=gap)
-    actual = packed_slot_layout(packed, alignment=alignment, gap=gap)
+    expected = packed_slot_layout(without_host_lengths, alignment=alignment, gap=gap)
+    actual = packed_slot_layout(with_host_lengths, alignment=alignment, gap=gap)
 
     assert expected.host_slot_lengths is None
     assert actual.total_slots == expected.total_slots
