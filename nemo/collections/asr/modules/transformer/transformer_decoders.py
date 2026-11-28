@@ -21,6 +21,7 @@ import torch.nn as nn
 from omegaconf import DictConfig
 
 from nemo.collections.asr.modules.transformer.transformer_modules import MultiHeadAttention, PositionWiseFF
+from nemo.collections.asr.parts.packed_sequence import compile_forward_packed
 from nemo.collections.asr.parts.submodules.adapters.attention_adapter_mixin import AttentionAdapterModuleMixin
 from nemo.collections.asr.parts.submodules.packed_attention import PackedAttentionContext
 from nemo.collections.asr.parts.utils import adapter_utils
@@ -277,6 +278,9 @@ class TransformerDecoder(nn.Module):
         self_attn: block of the self-attention of every block, see `TransformerDecoderBlock`
         cross_attn: block of the attention over the encoder states of every block, see `TransformerDecoderBlock`
         feed_forward: block of the feed-forward sub-layer of every block, see `TransformerDecoderBlock`
+        compile_packed_layers: run every block of ``forward_packed`` through ``torch.compile`` with a dynamic
+            token count, one compiled function for all blocks (see ``ConformerEncoder``'s option of the same name);
+            ``forward`` is not compiled. Keyword-only; defaults to False.
     """
 
     def __init__(
@@ -295,8 +299,13 @@ class TransformerDecoder(nn.Module):
         self_attn: ModuleBlock | None = None,
         cross_attn: ModuleBlock | None = None,
         feed_forward: ModuleBlock | None = None,
+        *,
+        compile_packed_layers: bool = False,
     ):
         super().__init__()
+        self.compile_packed_layers = compile_packed_layers
+        if compile_packed_layers:
+            compile_forward_packed()  # raises for a PyTorch it cannot patch now, not at the first training step
 
         if pre_ln and pre_ln_final_layer_norm:
             self.final_layer_norm = build_module(norm or nn.LayerNorm, normalized_shape=hidden_size)
@@ -422,7 +431,12 @@ class TransformerDecoder(nn.Module):
         if self.diagonal != 0:
             raise NotImplementedError("forward_packed implements the causal mask of diagonal 0.")
         for layer in self.layers:
-            decoder_states = layer.forward_packed(decoder_states, decoder_context, encoder_states, encoder_context)
+            if self.compile_packed_layers:
+                decoder_states = compile_forward_packed()(
+                    layer, decoder_states, decoder_context, encoder_states, encoder_context
+                )
+            else:
+                decoder_states = layer.forward_packed(decoder_states, decoder_context, encoder_states, encoder_context)
         if self.final_layer_norm is not None:
             decoder_states = self.final_layer_norm(decoder_states)
         return decoder_states

@@ -201,6 +201,10 @@ model:
     dropout_emb: 0.0 # The dropout used for embeddings
     dropout_att: 0.1 # The dropout for multi-headed attention modules
 
+    # with train_ds.pack_sequences: run every layer of the sequence-packed training forward through torch.compile
+    # (dynamic token count; the padded forward of evaluation and decoding stays eager)
+    # compile_packed_layers: true
+
   # Optional Transformer Encoder sandwitched between ASR Encoder and Transformer Ddcoder.
   # Only used if num_layers > 0
   transf_encoder:
@@ -238,6 +242,8 @@ model:
       hidden_act: relu
       pre_ln: true
       vocab_size: None  # Will be set by the model at runtime
+      # with train_ds.pack_sequences: the blocks of the sequence-packed training forward through torch.compile
+      # compile_packed_layers: true
 
   # Label Prediction Head (Token Classifier)
   head:

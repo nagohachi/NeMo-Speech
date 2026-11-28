@@ -136,6 +136,7 @@ def get_nemo_transformer(
             self_attn=cfg.get('self_attn', None),
             cross_attn=cfg.get('cross_attn', None),
             feed_forward=cfg.get('feed_forward', None),
+            compile_packed_layers=cfg.get('compile_packed_layers', False),
         )
 
     return model

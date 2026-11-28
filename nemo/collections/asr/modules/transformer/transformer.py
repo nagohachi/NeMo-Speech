@@ -196,6 +196,8 @@ class TransformerDecoderNM(DecoderModule, Exportable):
         self_attn: block of the self-attention of every block, see `TransformerDecoderBlock`
         cross_attn: block of the attention over the encoder states of every block, see `TransformerDecoderBlock`
         feed_forward: block of the feed-forward sub-layer of every block, see `TransformerDecoderBlock`
+        compile_packed_layers: compile the blocks of ``forward_packed`` (see `TransformerDecoder`);
+            keyword-only, defaults to False
     """
 
     DECODER_TYPE: type = TransformerDecoder
@@ -222,6 +224,8 @@ class TransformerDecoderNM(DecoderModule, Exportable):
         self_attn: ModuleBlock | None = None,
         cross_attn: ModuleBlock | None = None,
         feed_forward: ModuleBlock | None = None,
+        *,
+        compile_packed_layers: bool = False,
     ):
         super().__init__()
 
@@ -258,6 +262,7 @@ class TransformerDecoderNM(DecoderModule, Exportable):
             self_attn=self_attn,
             cross_attn=cross_attn,
             feed_forward=feed_forward,
+            compile_packed_layers=compile_packed_layers,
         )
 
     @typecheck()

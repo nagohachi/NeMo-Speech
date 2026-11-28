@@ -174,6 +174,13 @@ and it does not decode its batch, so it logs no ``training_batch`` metrics.
 
 In multi-GPU training, ``encoder.sync_max_audio_length: false`` keeps the encoder from reading the longest length across ranks back to the host at every step.
 
+``model.encoder.compile_packed_layers: true`` compiles the layers of the sequence-packed encoder forward with ``torch.compile``,
+and ``model.transf_decoder.config_dict.compile_packed_layers: true`` the blocks of the packed decoder forward,
+which speeds up the training step; evaluation and decoding run the padded forward, which is not compiled.
+The first training steps take longer while the layers compile; batches of other sizes reuse the compiled layers.
+The values differ from the uncompiled layers by floating-point rounding, and dropout draws other random masks.
+The option cannot be combined with activation checkpointing of the encoder layers: the encoder raises an error.
+
 .. _rnn-encoder-api:
 
 .. autoclass:: nemo.collections.asr.modules.RNNEncoder
