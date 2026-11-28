@@ -571,7 +571,8 @@ class FilterbankFeatures(nn.Module):
         block_offsets = torch.cat([seq_len.new_zeros(1), block_lengths.cumsum(0)])
         guarded_size = int(_round_up(host_seq_len + pad_left + pad_right, self.hop_length).sum())
         dither = self.dither if self.training else 0.0
-        # the dither noise is drawn here, outside the compiled functions, so both forms draw the same samples:
+        # the dither noise is drawn here, outside the compiled functions, so that the same seed gives the same noise
+        # with and without compile_packed:
         # one per waveform sample, or one per guarded sample when the exact padding dithers the guarded signal
         noise = None
         if dither > 0:

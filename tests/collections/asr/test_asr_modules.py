@@ -270,19 +270,29 @@ class TestASRModulesBasicTests:
             dict(log_zero_guard_type="clamp"),
             dict(mag_power=1.0),
             dict(linear_spec=True),
+            dict(dither=0.0),
+            dict(eval_mode=True),
+            dict(
+                normalize={
+                    "_target_": "nemo.collections.asr.parts.submodules.batchnorm.MaskedBatchNorm1d",
+                    "affine": False,
+                }
+            ),
         ],
-        ids=["narrowband", "clamp", "mag_power_1", "linear_spec"],
+        ids=["narrowband", "clamp", "mag_power_1", "linear_spec", "no_dither", "eval_mode", "norm_block"],
     )
     def test_AudioToMelSpectrogramPreprocessor_compiled_packed_branches_match_eager(self, options):
-        """Check the branches of the compiled frontend that the default options skip (narrowband augmentation, the
-        clamp guard of the logarithm, magnitudes without squaring, linear spectra) against the eager frontend."""
+        """Check the branches of the compiled frontend that the default options skip against the eager frontend:
+        narrowband augmentation, the clamp guard of the logarithm, magnitudes without squaring, linear spectra, no
+        dither noise (without dither and in evaluation mode) and a normalization block after the compiled log-mel."""
         options = dict(options)
         linear_spec = options.pop("linear_spec", False)
-        preprocessor_kwargs = dict(dither=1e-5, pad_to=0, **options)
-        eager_preprocessor = modules.AudioToMelSpectrogramPreprocessor(**preprocessor_kwargs).train()
+        eval_mode = options.pop("eval_mode", False)
+        preprocessor_kwargs = dict(dither=1e-5, pad_to=0) | options
+        eager_preprocessor = modules.AudioToMelSpectrogramPreprocessor(**preprocessor_kwargs).train(not eval_mode)
         compiled_preprocessor = modules.AudioToMelSpectrogramPreprocessor(
             **preprocessor_kwargs, compile_packed=True
-        ).train()
+        ).train(not eval_mode)
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
         _assert_compiled_packed_frontend_matches_eager(
