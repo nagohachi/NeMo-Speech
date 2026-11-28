@@ -133,22 +133,22 @@ def _load_int16_audio(cut, suppress_errors: bool) -> np.ndarray | None:
         offset, duration = cut.start, cut.duration
         # Recording.load_audio reads to the end of the recording when the cut covers nearly all of it
         read_duration = None if isclose(duration, recording.duration, abs_tol=1e-3) else duration
-        with soundfile.SoundFile(BytesIO(source.source) if source.type == "memory" else source.source) as audio:
-            if audio.subtype != "PCM_16":
+        with soundfile.SoundFile(BytesIO(source.source) if source.type == "memory" else source.source) as sound_file:
+            if sound_file.subtype != "PCM_16":
                 # soundfile would quantize other samples to int16, which no longer match the float32 path
                 raise _UnsupportedInt16Audio(
-                    f"int16 audio rows cannot read cut {cut.id}: its audio is {audio.subtype}, not 16-bit PCM."
+                    f"int16 audio rows cannot read cut {cut.id}: its audio is {sound_file.subtype}, not 16-bit PCM."
                 )
-            if audio.samplerate != recording.sampling_rate or audio.channels != 1:
+            if sound_file.samplerate != recording.sampling_rate or sound_file.channels != 1:
                 # metadata that does not describe the file is a data error, not a failed read
                 raise _UnsupportedInt16Audio(
-                    f"int16 audio rows cannot read cut {cut.id}: the audio has {audio.channels} channel(s) at "
-                    f"{audio.samplerate} Hz, the recording declares 1 channel at {recording.sampling_rate} Hz."
+                    f"int16 audio rows cannot read cut {cut.id}: the audio has {sound_file.channels} channel(s) at "
+                    f"{sound_file.samplerate} Hz, the recording declares 1 channel at {recording.sampling_rate} Hz."
                 )
             if offset > 0:
-                audio.seek(compute_num_samples(offset, audio.samplerate))
-            num_samples = -1 if read_duration is None else compute_num_samples(read_duration, audio.samplerate)
-            samples = audio.read(frames=num_samples, dtype="int16", always_2d=True).T
+                sound_file.seek(compute_num_samples(offset, sound_file.samplerate))
+            num_samples = -1 if read_duration is None else compute_num_samples(read_duration, sound_file.samplerate)
+            samples = sound_file.read(frames=num_samples, dtype="int16", always_2d=True).T
         if read_duration is not None:
             available_duration = samples.shape[1] / recording.sampling_rate
             if available_duration < read_duration - get_audio_duration_mismatch_tolerance():
@@ -166,6 +166,7 @@ def _load_int16_audio(cut, suppress_errors: bool) -> np.ndarray | None:
 
 
 def _get_int16_unsupported_reason(cut, recording) -> str | None:
+    """Return why the int16 reader cannot read ``cut`` exactly, or ``None`` when it can."""
     if recording is None:
         return f"a {type(cut).__name__} without a recording of its own"
     if len(recording.sources) != 1 or recording.num_channels != 1:
