@@ -499,7 +499,7 @@ class FilterbankFeatures(nn.Module):
         seq_len = torch.floor_divide((seq_len + pad_amount - self.n_fft), self.hop_length)
         return seq_len.to(dtype=torch.long)
 
-    def _run_packed_step(self, function):
+    def _get_packed_function(self, function):
         """Return ``function`` itself, or compiled with dynamic sizes when ``compile_packed`` is on."""
         return compile_packed_function(function) if self.compile_packed else function
 
@@ -573,7 +573,7 @@ class FilterbankFeatures(nn.Module):
         if dither > 0:
             num_noise_samples = x.numel() if self.stft_pad_amount is None else guarded_size
             noise = torch.randn(num_noise_samples, dtype=x.dtype, device=x.device)
-        guarded = self._run_packed_step(_guard_packed_waveforms)(
+        guarded = self._get_packed_function(_guard_packed_waveforms)(
             x,
             noise,
             seq_len,
@@ -602,7 +602,7 @@ class FilterbankFeatures(nn.Module):
                 device=x.device,
             )
         # the compiled function takes the real view: complex tensors are not supported by the compiler
-        spectra, frame_sequence_ids = self._run_packed_step(_calc_packed_power_spectra)(
+        spectra, frame_sequence_ids = self._get_packed_function(_calc_packed_power_spectra)(
             torch.view_as_real(spectra),
             feature_lengths,
             block_offsets,
@@ -623,7 +623,7 @@ class FilterbankFeatures(nn.Module):
                 host_lengths=host_feature_lengths,
             )
 
-        features = self._run_packed_step(_calc_packed_log_mel)(
+        features = self._get_packed_function(_calc_packed_log_mel)(
             spectra,
             self.fb,
             feature_lengths,
