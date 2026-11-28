@@ -25,7 +25,7 @@ from torch.nn import LayerNorm
 from nemo.collections.asr.parts.packed_sequence import (
     PackedEncoderActivations,
     PackedSlotLayout,
-    _compile_without_ddp_optimizer,
+    compile_without_ddp_optimizer,
     lengths_to_cu_seqlens,
     packed_slot_layout,
 )
@@ -869,7 +869,7 @@ class ConvSubsampling(torch.nn.Module):
                 first_depthwise.bias,
                 *_layer_padding(conv0),
                 torch.full((1,), total_slots, dtype=torch.int64, device=x.device),
-                relu_out_valid=stage_valid_mask,
+                relu_out_valid_mask=stage_valid_mask,
             )
             current_lengths, host_current, current_offsets = _advance_packed_stage(
                 first_depthwise, current_lengths, host_current, current_offsets
@@ -1358,7 +1358,7 @@ def _compile_relu_mask():
 
     # inside DistributedDataParallel as the packed layers are (see compile_forward_packed); one kernel has nothing
     # for the DDP optimizer to split
-    return _compile_without_ddp_optimizer(apply_relu_mask)
+    return compile_without_ddp_optimizer(apply_relu_mask)
 
 
 def _advance_packed_stage(layer, lengths, host_lengths, slot_offsets):

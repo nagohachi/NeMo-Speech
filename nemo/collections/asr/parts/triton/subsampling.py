@@ -93,19 +93,19 @@ def _backward_configs():
 
 @triton.jit
 def _window_cells(
-    out_row, bin0_col, relu_out_len, relu_out_freq, pad_start, relu_out_valid_ptr, SLOT_MASK: tl.constexpr
+    out_row, bin0_col, relu_out_len, relu_out_freq, pad_start, relu_out_valid_mask_ptr, SLOT_MASK: tl.constexpr
 ):
     """Where each window position sits in `relu_out`, and whether that cell exists.
 
     With SLOT_MASK the batch holds one row of sequence-packed utterances: a `relu_out` row exists
-    where ``relu_out_valid`` is non-zero (its slot lies inside an utterance), not up to a length.
+    where ``relu_out_valid_mask`` is non-zero (its slot lies inside an utterance), not up to a length.
     """
     window_pos = tl.arange(0, PAD)
     row = STRIDE * out_row + window_pos // WINDOW_COLS - pad_start
     col = STRIDE * bin0_col + window_pos % WINDOW_COLS - pad_start
     cell_exists = (row >= 0) & (row < relu_out_len) & (col >= 0) & (col < relu_out_freq) & (window_pos < WINDOW_SIZE)
     if SLOT_MASK:
-        cell_exists = cell_exists & (tl.load(relu_out_valid_ptr + row, mask=cell_exists, other=0) != 0)
+        cell_exists = cell_exists & (tl.load(relu_out_valid_mask_ptr + row, mask=cell_exists, other=0) != 0)
     return row, col, cell_exists
 
 
@@ -162,7 +162,7 @@ def _forward_kernel(
     mel_len_ptr,
     relu_out_len_ptr,
     out_len_ptr,
-    relu_out_valid_ptr,
+    relu_out_valid_mask_ptr,
     pad_start,
     channels,
     out_time,
@@ -212,7 +212,7 @@ def _forward_kernel(
                 this_relu_out_len,
                 relu_out_freq,
                 pad_start,
-                relu_out_valid_ptr,
+                relu_out_valid_mask_ptr,
                 SLOT_MASK,
             )
             feats = _load_window(
@@ -284,7 +284,7 @@ def _backward_kernel(
     mel_len_ptr,
     relu_out_len_ptr,
     out_len_ptr,
-    relu_out_valid_ptr,
+    relu_out_valid_mask_ptr,
     pad_start,
     channels,
     out_time,
@@ -337,7 +337,7 @@ def _backward_kernel(
                     this_relu_out_len,
                     relu_out_freq,
                     pad_start,
-                    relu_out_valid_ptr,
+                    relu_out_valid_mask_ptr,
                     SLOT_MASK,
                 )
                 feats = _load_window(
@@ -447,12 +447,12 @@ class _FusedSubsampling(torch.autograd.Function):
         pad_start,
         dims,
         dtype,
-        relu_out_valid,
+        relu_out_valid_mask,
     ):
         out_time, out_freq, relu_out_freq = dims
-        slot_mask = relu_out_valid is not None
+        slot_mask = relu_out_valid_mask is not None
         # any int tensor stands in for the pointer the kernels do not read without SLOT_MASK
-        relu_out_valid = relu_out_valid if slot_mask else mel_lengths
+        relu_out_valid_mask = relu_out_valid_mask if slot_mask else mel_lengths
         batch_size, _, _, mel_freq = mel.shape
         channels = conv_weight.shape[0]
         mel = mel.contiguous().to(dtype)
@@ -481,7 +481,7 @@ class _FusedSubsampling(torch.autograd.Function):
                 mel_lengths,
                 relu_out_lengths,
                 out_lengths,
-                relu_out_valid,
+                relu_out_valid_mask,
                 pad_start,
                 channels,
                 out_time,
@@ -505,7 +505,7 @@ class _FusedSubsampling(torch.autograd.Function):
             mel_lengths.clone(),
             relu_out_lengths.clone(),
             out_lengths.clone(),
-            relu_out_valid,
+            relu_out_valid_mask,
         )
         ctx.slot_mask = slot_mask
         ctx.shapes = (batch_size, channels, mel_freq, relu_out_freq, out_time, out_freq, pad_start)
@@ -523,7 +523,7 @@ class _FusedSubsampling(torch.autograd.Function):
             mel_lengths,
             relu_out_lengths,
             out_lengths,
-            relu_out_valid,
+            relu_out_valid_mask,
         ) = ctx.saved_tensors
         (batch_size, channels, mel_freq, relu_out_freq, out_time, out_freq, pad_start) = ctx.shapes
         grad_output = grad_output.contiguous()
@@ -553,7 +553,7 @@ class _FusedSubsampling(torch.autograd.Function):
             mel_lengths,
             relu_out_lengths,
             out_lengths,
-            relu_out_valid,
+            relu_out_valid_mask,
             pad_start,
             channels,
             out_time,
@@ -585,7 +585,7 @@ class _FusedSubsampling(torch.autograd.Function):
             None,  # pad_start
             None,  # dims
             None,  # dtype
-            None,  # relu_out_valid
+            None,  # relu_out_valid_mask
         )
 
 
@@ -598,7 +598,7 @@ def fused_conv_relu_dw(
     pad_start: int,
     pad_end: int,
     lengths: torch.Tensor,
-    relu_out_valid: torch.Tensor | None = None,
+    relu_out_valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse ``conv -> ReLU -> depthwise``, with the between-stage length masking folded in.
 
@@ -614,7 +614,7 @@ def fused_conv_relu_dw(
         pad_start: padding at the start of both axes.
         pad_end: padding at the end; only affects the output extent.
         lengths: ``(batch,)`` valid time steps.
-        relu_out_valid: for one row of sequence-packed utterances (batch 1, gaps of zeros between them),
+        relu_out_valid_mask: for one row of sequence-packed utterances (batch 1, gaps of zeros between them),
             ``(relu_out_time,)`` with a non-zero entry for every first-stage time step inside an utterance:
             the masking between the stages keeps these steps instead of a prefix of ``lengths``.
             The output beyond the utterances is not zeroed then; the caller masks or drops it.
@@ -639,13 +639,13 @@ def fused_conv_relu_dw(
     )
     relu_out_lengths = _downsampled_length(lengths, pad_total)
     out_lengths = _downsampled_length(relu_out_lengths, pad_total)
-    if relu_out_valid is not None:
-        if batch_size != 1 or relu_out_valid.shape != (relu_out_time,):
+    if relu_out_valid_mask is not None:
+        if batch_size != 1 or relu_out_valid_mask.shape != (relu_out_time,):
             raise ValueError(
-                f"relu_out_valid takes one row of packed utterances: batch 1 and shape ({relu_out_time},), "
-                f"got batch {batch_size} and shape {tuple(relu_out_valid.shape)}."
+                f"relu_out_valid_mask takes one row of packed utterances: batch 1 and shape ({relu_out_time},), "
+                f"got batch {batch_size} and shape {tuple(relu_out_valid_mask.shape)}."
             )
-        relu_out_valid = relu_out_valid.to(device=mel.device, dtype=torch.int8).contiguous()
+        relu_out_valid_mask = relu_out_valid_mask.to(device=mel.device, dtype=torch.int8).contiguous()
     # Autocast only rewrites aten ops, never a Triton launch, so the cast is done by hand.
     dtype = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled() else mel.dtype
     with torch.autocast("cuda", enabled=False):
@@ -661,6 +661,6 @@ def fused_conv_relu_dw(
             pad_start,
             dims,
             dtype,
-            relu_out_valid,
+            relu_out_valid_mask,
         )
     return output, out_lengths
