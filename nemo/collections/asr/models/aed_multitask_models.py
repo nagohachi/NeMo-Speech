@@ -231,7 +231,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
         # Optional auxiliary CTC loss on the encoder output (hybrid CTC/attention training):
         # the training loss becomes (1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss.
-        # The CTC targets are the transcript tokens without the prompt and the end-of-text token.
+        # The CTC targets are the transcript tokens without the prompt, which the prompt formats end without EOS.
         aux_ctc = self.cfg.get("aux_ctc") or {}
         _check_aux_ctc_config(aux_ctc)
         self.ctc_loss_weight = float(aux_ctc.get("ctc_loss_weight", 0.0))
@@ -879,7 +879,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 log_probs=self.ctc_decoder(encoder_output=encoded),
                 targets=batch.transcript,
                 input_lengths=encoded_len,
-                target_lengths=self._calc_ctc_target_lengths(batch.transcript, batch.transcript_lens),
+                target_lengths=batch.transcript_lens,
             )
             loss = (1 - self.ctc_loss_weight) * transf_loss + self.ctc_loss_weight * ctc_loss
             ctc_metrics = {'train_ctc_loss': ctc_loss, 'train_attn_loss': transf_loss}
@@ -914,11 +914,6 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             }
         )
         return {"loss": loss, "log": metric_dict}
-
-    def _calc_ctc_target_lengths(self, transcript: torch.Tensor, transcript_lens: torch.Tensor) -> torch.Tensor:
-        """Return the lengths of the CTC targets: the transcript tokens without a trailing end-of-text token."""
-        last_tokens = transcript.gather(1, (transcript_lens - 1).clamp(min=0).unsqueeze(1)).squeeze(1)
-        return transcript_lens - ((last_tokens == self.tokenizer.eos_id) & (transcript_lens > 0)).long()
 
     def validation_pass(self, batch: PromptedAudioToTextMiniBatch, batch_idx, dataloader_idx=0, eval_mode="val"):
         input_ids, labels = batch.get_decoder_inputs_outputs()

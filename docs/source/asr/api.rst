@@ -50,6 +50,20 @@ Model Classes
     :members: setup_training_data, setup_optimization, setup_validation_data, setup_test_data, register_artifact
 
 
+Auxiliary CTC loss of EncDecMultiTaskModel
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``model.aux_ctc`` adds a ``ConvASRDecoder`` on the encoder output of ``EncDecMultiTaskModel`` and trains with
+``(1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss``.
+The CTC targets are the transcript tokens without the prompt; the Canary prompt formats already leave the end-of-text token out of them.
+
+* ``ctc_loss_weight`` (default ``0.0``, no CTC loss): a number between 0 and 1.
+* ``ctc_reduction`` (default ``mean_volume``): ``mean_volume`` divides the CTC loss by the number of target tokens, a per-token loss like the attention cross-entropy; ``mean_batch``, ``mean`` and ``sum`` are the reductions of ``CTCLoss``.
+* ``zero_infinity`` (default ``false``): a transcript with more tokens than its utterance has encoder frames makes the CTC loss infinite; ``true`` sets the loss of such an utterance and its gradients to zero instead, so that it trains on the attention loss alone.
+
+``ctc_reduction`` and ``zero_infinity`` require a positive ``ctc_loss_weight``.
+
+
 .. _asr-api-modules:
 
 Modules
@@ -139,13 +153,6 @@ The packed path covers the training forward and backward and leaves out what the
 * the causal mask is the standard one, a ``diagonal`` other than 0 raises;
 * learned positional encodings bound the sequence length by ``max_sequence_length`` as in the padded path;
 * a sequence without encoder states gets a zero cross-attention context, where the padded ``forward`` attends uniformly over its masked frames.
-
-The auxiliary CTC loss of ``EncDecMultiTaskModel`` (``model.aux_ctc``) adds a ``ConvASRDecoder`` on the encoder output and trains with
-``(1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss``.
-``ctc_reduction`` defaults to ``mean_volume``, the CTC loss divided by the number of target tokens, a per-token loss like the attention cross-entropy.
-The CTC targets are the transcript tokens without the prompt and without a final end-of-text token.
-``ctc_loss_weight`` must be between 0 and 1.
-A transcript with more tokens than its utterance has encoder frames makes the CTC loss infinite; ``zero_infinity: true`` sets the loss of such an utterance and its gradients to zero instead, so that it trains on the attention loss alone.
 
 
 .. _rnn-encoder-api:

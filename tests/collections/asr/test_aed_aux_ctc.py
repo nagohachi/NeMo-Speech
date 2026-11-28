@@ -69,19 +69,6 @@ def make_asr_model_ctc(asr_model):
 
 
 @pytest.mark.unit
-def test_ctc_target_lengths_exclude_end_of_text(asr_model_ctc, cuts):
-    batch = _make_padded_dataset(asr_model_ctc)[cuts]
-    eos = asr_model_ctc.tokenizer.eos_id
-    lens = asr_model_ctc._calc_ctc_target_lengths(batch.transcript, batch.transcript_lens)
-    # the answers of the prompt format end without the end-of-text token: the targets are the whole answers
-    assert torch.equal(lens, batch.transcript_lens)
-    # an answer that ends with it loses it
-    with_eos = torch.nn.functional.pad(batch.transcript, (0, 1), value=asr_model_ctc.tokenizer.pad_id)
-    with_eos[torch.arange(len(lens)), batch.transcript_lens] = eos
-    torch.testing.assert_close(asr_model_ctc._calc_ctc_target_lengths(with_eos, batch.transcript_lens + 1), lens)
-
-
-@pytest.mark.unit
 def test_padded_training_step_mixes_attention_and_ctc_losses(asr_model_ctc, cuts):
     """Check that the padded step trains on 0.7 * attention loss + 0.3 * CTC loss, the CTC loss computed here
     from the encoder output, and that the CTC head gets gradients."""
