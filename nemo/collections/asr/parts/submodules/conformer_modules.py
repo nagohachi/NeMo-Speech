@@ -551,7 +551,7 @@ class ConformerConvolution(nn.Module):
         elif _runs_packed_depthwise_kernel(self.depthwise_conv, x):
             # the same convolution on the frame rows: a tap that leaves its utterance reads zero
             conv = self.depthwise_conv
-            x = run_packed_depthwise_conv1d(x, conv.weight, conv.bias, layout.token_slots, conv._left_padding)
+            x = run_packed_depthwise_conv1d(x, conv.weight, conv.bias, layout.token_slots, conv.left_padding)
         else:
             # one channel-first sequence over the gapped slots; the empty slots are the zero padding between utterances
             slots = layout.scatter(x).transpose(0, 1).unsqueeze(0)
@@ -662,5 +662,5 @@ def _runs_packed_depthwise_kernel(conv: nn.Module, x: torch.Tensor) -> bool:
         and conv.dilation == (1,)
         and conv.padding == (0,)
         and conv.padding_mode == 'zeros'
-        and conv._left_padding + conv._right_padding == conv.kernel_size[0] - 1
+        and conv.left_padding + conv.right_padding == conv.kernel_size[0] - 1
     )

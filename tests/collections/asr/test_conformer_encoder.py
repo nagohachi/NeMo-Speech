@@ -650,9 +650,11 @@ class TestPackedConformerConvolution:
         gradient to the depthwise bias, which the batch statistics of training mode cancel (a zero to compare)."""
         monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
         calls = []
-        kernel = conformer_modules_module.run_packed_depthwise_conv1d
+        original_run_conv = conformer_modules_module.run_packed_depthwise_conv1d
         monkeypatch.setattr(
-            conformer_modules_module, "run_packed_depthwise_conv1d", lambda *args: calls.append(1) or kernel(*args)
+            conformer_modules_module,
+            "run_packed_depthwise_conv1d",
+            lambda *args: calls.append(1) or original_run_conv(*args),
         )
         torch.manual_seed(1)
         module = ConformerConvolution(d_model=48, kernel_size=kernel_size, conv_context_size=conv_context_size)
@@ -664,14 +666,17 @@ class TestPackedConformerConvolution:
         lengths = torch.tensor([300, 1, 3, 77, 9])
         padded = torch.randn(len(lengths), 300, 48, dtype=torch.float64)
         outputs, grads = {}, {}
-        for name, conv, device, dtype in (("cuda", module, "cuda", torch.float32), ("cpu", reference, "cpu", None)):
+        for name, conv_module, device, dtype in (
+            ("cuda", module, "cuda", torch.float32),
+            ("cpu", reference, "cpu", None),
+        ):
             packed = pack_encoder_output(padded.to(device=device, dtype=dtype or padded.dtype), lengths.to(device))
             data = packed.data.detach().requires_grad_()
-            out = conv.forward_packed(data, packed_slot_layout(packed, gap=kernel_size - 1))
-            weights = torch.linspace(-1, 1, out.numel(), dtype=torch.float64).view_as(out)
-            (out * weights.to(device=device, dtype=out.dtype)).sum().backward()
+            out = conv_module.forward_packed(data, packed_slot_layout(packed, gap=kernel_size - 1))
+            loss_weights = torch.linspace(-1, 1, out.numel(), dtype=torch.float64).view_as(out)
+            (out * loss_weights.to(device=device, dtype=out.dtype)).sum().backward()
             outputs[name] = out.detach().double().cpu()
-            grads[name] = [data.grad.double().cpu()] + [p.grad.double().cpu() for p in conv.parameters()]
+            grads[name] = [data.grad.double().cpu()] + [p.grad.double().cpu() for p in conv_module.parameters()]
         assert calls
         # the float32 sums of the pointwise convolutions and the normalization reach 1.1e-5 (kernel size 4);
         # the depthwise kernel alone is held to 1e-5 in test_packed_depthwise_conv.py

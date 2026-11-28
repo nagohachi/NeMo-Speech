@@ -148,8 +148,8 @@ def test_non_contiguous_input_and_bias_give_the_contiguous_result():
     strided_x = x.t().contiguous().t()
     strided_bias = torch.stack([bias, torch.zeros_like(bias)], dim=1)[:, 0]
     assert not strided_x.is_contiguous() and not strided_bias.is_contiguous()
-    expected = run_packed_depthwise_conv1d(x, weight, bias, layout.token_slots, conv._left_padding)
-    actual = run_packed_depthwise_conv1d(strided_x, weight, strided_bias, layout.token_slots, conv._left_padding)
+    expected = run_packed_depthwise_conv1d(x, weight, bias, layout.token_slots, conv.left_padding)
+    actual = run_packed_depthwise_conv1d(strided_x, weight, strided_bias, layout.token_slots, conv.left_padding)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -181,7 +181,7 @@ def _run_gapped(conv, layout, x, grad):
 
 def _run_kernel(conv, layout, x, grad):
     x = x.detach().requires_grad_()
-    out = run_packed_depthwise_conv1d(x, conv.weight, conv.bias, layout.token_slots, conv._left_padding)
+    out = run_packed_depthwise_conv1d(x, conv.weight, conv.bias, layout.token_slots, conv.left_padding)
     return out, _calc_grads(out, x, conv, grad)
 
 

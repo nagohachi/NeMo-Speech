@@ -129,6 +129,16 @@ class CausalConv1D(nn.Conv1d):
             dtype=dtype,
         )
 
+    @property
+    def left_padding(self) -> int:
+        """Zero frames that the convolution adds before its input."""
+        return self._left_padding
+
+    @property
+    def right_padding(self) -> int:
+        """Zero frames that the convolution adds after its input."""
+        return self._right_padding
+
     def update_cache(self, x, cache=None):
         if cache is None:
             new_x = F.pad(x, pad=(self._left_padding, self._right_padding))
