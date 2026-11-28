@@ -21,6 +21,7 @@ import math
 import pytest
 import torch
 from omegaconf import DictConfig
+from torch._dynamo.utils import counters
 
 from nemo.collections.asr.modules.transformer.transformer import TransformerDecoderNM
 from nemo.collections.asr.modules.transformer.transformer_modules import (
@@ -420,33 +421,31 @@ class TestCompiledPackedTransformerDecoder:
         since a key bias cancels in the softmax and its gradient is rounding noise in both forms."""
         torch._dynamo.reset()
         torch.manual_seed(0)
-        eager = _composed_decoder()
-        compiled = _composed_decoder(compile_packed_layers=True)
-        compiled.load_state_dict(eager.state_dict())
+        eager_decoder = _composed_decoder()
+        compiled_decoder = _composed_decoder(compile_packed_layers=True)
+        compiled_decoder.load_state_dict(eager_decoder.state_dict())
         input_ids = torch.tensor([[10, 1, 5, 7, 2], [10, 3, 4, 0, 0], [10, 6, 0, 0, 0]])
         input_lengths = torch.tensor([5, 3, 2])
         encoder_lengths = torch.tensor([9, 4, 7])
         encoder_states = torch.randn(3, 9, 16)
-        outputs, grads = [], []
-        for decoder in (eager, compiled):
+        outputs, grads = {}, {}
+        for role, decoder in (("eager", eager_decoder), ("compiled", compiled_decoder)):
             packed = decoder.forward_packed(*_packed_inputs(input_ids, input_lengths, encoder_states, encoder_lengths))
             weights = torch.randn(packed.shape, generator=torch.Generator().manual_seed(3))
             (packed * weights).sum().backward()
-            outputs.append(packed.detach())
-            grads.append({name: p.grad.clone() for name, p in decoder.named_parameters() if p.grad is not None})
-        torch.testing.assert_close(outputs[1], outputs[0], rtol=1e-4, atol=1e-5)
-        assert grads[1].keys() == grads[0].keys()
-        scale = max(float(grad.abs().max()) for grad in grads[0].values())
-        for name, grad in grads[0].items():
-            torch.testing.assert_close(grads[1][name], grad, rtol=1e-4, atol=1e-5 * scale, msg=name)
+            outputs[role] = packed.detach()
+            grads[role] = {name: p.grad.clone() for name, p in decoder.named_parameters() if p.grad is not None}
+        torch.testing.assert_close(outputs["compiled"], outputs["eager"], rtol=1e-4, atol=1e-5)
+        assert grads["compiled"].keys() == grads["eager"].keys()
+        scale = max(float(grad.abs().max()) for grad in grads["eager"].values())
+        for name, eager_grad in grads["eager"].items():
+            torch.testing.assert_close(grads["compiled"][name], eager_grad, rtol=1e-4, atol=1e-5 * scale, msg=name)
 
     @pytest.mark.unit
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_compiled_layers_on_cuda_without_graph_breaks_or_recompiles(self):
         """Check that on CUDA (FlashAttention varlen, rotary self-attention) one graph serves other batch shapes."""
-        from torch._dynamo.utils import counters
-
         torch._dynamo.reset()
         counters.clear()
         torch.manual_seed(1)

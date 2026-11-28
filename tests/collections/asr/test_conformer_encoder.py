@@ -681,20 +681,20 @@ class TestPackedConformerEncoder:
         ).train()
         compiled_encoder.load_state_dict(eager_encoder.state_dict())
         for lengths in (torch.tensor([20, 13]), torch.tensor([17, 9, 30])):
-            outputs, grads = [], []
-            for encoder in (eager_encoder, compiled_encoder):
+            outputs, grads = {}, {}
+            for role, encoder in (("eager", eager_encoder), ("compiled", compiled_encoder)):
                 encoder.zero_grad()
                 features = _packed_test_features(lengths, dtype=torch.float32).transpose(1, 2)
                 out = encoder.forward_sequence_packed(pack_encoder_output(features, lengths))
                 weights = torch.randn(out.data.shape, generator=torch.Generator().manual_seed(3))
                 (out.data * weights).sum().backward()
-                outputs.append(out.data.detach())
-                grads.append({name: p.grad.clone() for name, p in encoder.named_parameters() if p.grad is not None})
-            torch.testing.assert_close(outputs[1], outputs[0], rtol=1e-4, atol=1e-5)
-            assert grads[1].keys() == grads[0].keys()
-            scale = max(float(grad.abs().max()) for grad in grads[0].values())
-            for name, grad in grads[0].items():
-                torch.testing.assert_close(grads[1][name], grad, rtol=1e-4, atol=1e-5 * scale, msg=name)
+                outputs[role] = out.data.detach()
+                grads[role] = {name: p.grad.clone() for name, p in encoder.named_parameters() if p.grad is not None}
+            torch.testing.assert_close(outputs["compiled"], outputs["eager"], rtol=1e-4, atol=1e-5)
+            assert grads["compiled"].keys() == grads["eager"].keys()
+            scale = max(float(grad.abs().max()) for grad in grads["eager"].values())
+            for name, eager_grad in grads["eager"].items():
+                torch.testing.assert_close(grads["compiled"][name], eager_grad, rtol=1e-4, atol=1e-5 * scale, msg=name)
 
     @pytest.mark.unit
     @pytest.mark.gpu
