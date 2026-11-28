@@ -218,6 +218,33 @@ class TestPackedCTCLossKernel:
         self._compare(criterion, logits, lengths, targets, target_lengths, atol=1e-4, rtol=1e-4)
 
     @pytest.mark.unit
+    def test_without_length_check(self):
+        """Check that check_lengths=False reads nothing back and sizes the states by the targets width:
+        the same loss and gradient, with more states than the longest target needs."""
+        torch.manual_seed(17)
+        lengths = torch.tensor([9, 7, 4], device="cuda")
+        targets = torch.zeros(3, 9, dtype=torch.long, device="cuda")
+        targets[:, :3] = torch.tensor([[1, 2, 1], [2, 2, 0], [1, 0, 0]], device="cuda")
+        target_lengths = torch.tensor([3, 2, 1], device="cuda")
+        log_probs = pack_encoder_output(torch.randn(3, 9, 4, device="cuda").log_softmax(-1), lengths)
+        criterion = CTCLoss(num_classes=3, reduction="none")
+        # the gradients are taken at the packed data: the boolean gather of pack_encoder_output reads the device
+        checked_data = log_probs.data.clone().requires_grad_()
+        checked = criterion.forward_packed(log_probs.with_data(checked_data), targets, target_lengths)
+        checked.sum().backward()
+        unchecked_data = log_probs.data.clone().requires_grad_()
+        unchecked_input = log_probs.with_data(unchecked_data)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            unchecked = criterion.forward_packed(unchecked_input, targets, target_lengths, check_lengths=False)
+            unchecked.sum().backward()
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.testing.assert_close(unchecked, checked)
+        torch.testing.assert_close(unchecked_data.grad, checked_data.grad)
+
+    @pytest.mark.unit
     def test_float32_under_autocast(self):
         logits, lengths, targets, target_lengths = self._small_case("cuda")
         self._compare(CTCLoss(num_classes=4, reduction="sum"), logits, lengths, targets, target_lengths, autocast=True)

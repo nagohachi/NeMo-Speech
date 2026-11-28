@@ -30,6 +30,7 @@ from nemo.collections.asr.modules.transformer_encoder import (
     _make_sliding_window_mod,
 )
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
+from nemo.collections.asr.parts.packed_sequence import PackedEncoderActivations, pack_encoder_output
 from nemo.collections.asr.parts.submodules.multi_head_attention import RotaryPositionalEncoding
 
 
@@ -124,6 +125,32 @@ class TestFeatureStacking:
         out, out_lengths = stacking(x, lengths)
         assert out.shape == (B, stacking.compute_num_out_frames(T), 256)
         assert out_lengths[0].item() == stacking.compute_num_out_frames(T)
+
+    @pytest.mark.unit
+    def test_packed_output_carries_host_lengths_without_a_device_read(self, monkeypatch):
+        """Check that packed input with host lengths gives the output of input without them, with the host copy of
+        the output lengths, and reads no tensor back with item()."""
+        stacking = FeatureStacking(subsampling_factor=4, feat_in=8, feat_out=16).eval()
+        lengths = torch.tensor([13, 0, 8, 1])
+        with_host_lengths = pack_encoder_output(torch.randn(4, 13, 8), lengths)
+        without_host_lengths = PackedEncoderActivations.from_validated(
+            with_host_lengths.data,
+            with_host_lengths.lengths,
+            with_host_lengths.cu_seqlens,
+            with_host_lengths.max_seqlen,
+        )
+        expected = stacking.forward_packed(without_host_lengths)
+
+        def fail_on_item(tensor):
+            raise AssertionError("read a tensor back with item()")
+
+        monkeypatch.setattr(torch.Tensor, "item", fail_on_item)
+        actual = stacking.forward_packed(with_host_lengths)
+        monkeypatch.undo()
+        torch.testing.assert_close(actual.data, expected.data, rtol=0, atol=0)
+        assert torch.equal(actual.lengths, expected.lengths)
+        assert expected.host_lengths is None
+        assert actual.host_lengths.device.type == "cpu" and torch.equal(actual.host_lengths, actual.lengths)
 
 
 class TestRotaryPositionalEncoding:

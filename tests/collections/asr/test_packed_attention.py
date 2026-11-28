@@ -20,7 +20,11 @@ import torch
 import torch._dynamo
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from nemo.collections.asr.parts.packed_sequence import pack_encoder_output, packed_sequence_ids
+from nemo.collections.asr.parts.packed_sequence import (
+    PackedEncoderActivations,
+    pack_encoder_output,
+    packed_sequence_ids,
+)
 from nemo.collections.asr.parts.submodules import packed_attention as packed_attention_module
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     RelPositionalEncoding,
@@ -195,6 +199,50 @@ def _dense_window_attention(q, k, v, lengths, key_window, rel_pos_bias=None):
             outputs.append(torch.einsum("hj,jhd->hd", torch.softmax(scores, dim=-1), v[keys]))
         offset += length
     return torch.stack(outputs)
+
+
+@pytest.mark.unit
+def test_sequence_slices_from_host_lengths():
+    """Check that the reference path slices the utterances from the host lengths when the activations carry them,
+    with device boundaries that differ from the host lengths so that the two sources give different slices."""
+    data = torch.randn(8, 2)
+    lengths = torch.tensor([5, 0, 3])
+    shifted_cu_seqlens = torch.tensor([0, 4, 4, 8], dtype=torch.int32)
+    with_host_lengths = PackedEncoderActivations.from_validated(
+        data, lengths, shifted_cu_seqlens, 5, host_lengths=lengths.clone()
+    )
+    without_host_lengths = PackedEncoderActivations.from_validated(data, lengths, shifted_cu_seqlens, 5)
+    assert PackedAttentionContext(with_host_lengths).sequence_slices == ((0, 5), (5, 5), (5, 8))
+    assert PackedAttentionContext(without_host_lengths).sequence_slices == ((0, 4), (4, 4), (4, 8))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("lengths", [[3, 0, 2], [0, 0], [4]])
+def test_context_from_lengths_with_given_sizes_matches_read_sizes(lengths):
+    """Check that passing total_tokens and max_seqlen builds the same context as reading them from the lengths."""
+    lengths = torch.tensor(lengths)
+    read = PackedAttentionContext.from_lengths(lengths)
+    given = PackedAttentionContext.from_lengths(
+        lengths, total_tokens=int(lengths.sum()), max_seqlen=int(lengths.max()) if lengths.numel() else 0
+    )
+    assert (given.total_tokens, given.max_seqlen) == (read.total_tokens, read.max_seqlen)
+    assert torch.equal(given.cu_seqlens, read.cu_seqlens)
+    assert torch.equal(given.position_ids, read.position_ids)
+    assert given.sequence_slices == read.sequence_slices
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_context_from_lengths_with_given_sizes_reads_nothing_from_the_device():
+    """Check that total_tokens and max_seqlen spare from_lengths its device reads."""
+    lengths = torch.tensor([3, 0, 2], device="cuda")
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        context = PackedAttentionContext.from_lengths(lengths, total_tokens=5, max_seqlen=3)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert context.cu_seqlens.tolist() == [0, 3, 3, 5]
 
 
 class TestPackedAttentionKeyWindow:

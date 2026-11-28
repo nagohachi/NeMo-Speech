@@ -942,7 +942,11 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             if isinstance(_unwrap_checkpoint(self.pre_encode), nn.Linear):
                 # the input's padding metadata describes features, not the projected states
                 packed = PackedEncoderActivations.from_validated(
-                    self.pre_encode(packed.data), packed.lengths, packed.cu_seqlens, packed.max_seqlen
+                    self.pre_encode(packed.data),
+                    packed.lengths,
+                    packed.cu_seqlens,
+                    packed.max_seqlen,
+                    host_lengths=packed.host_lengths,
                 )
             else:
                 packed = _forward_packed_module(self.pre_encode, packed)
@@ -1009,7 +1013,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if self.out_proj is not None:
             x = self.out_proj(x)
         # encoder outputs pad with zeros, whatever padding metadata the input carried
-        return PackedEncoderActivations.from_validated(x, packed.lengths, packed.cu_seqlens, packed.max_seqlen)
+        return PackedEncoderActivations.from_validated(
+            x, packed.lengths, packed.cu_seqlens, packed.max_seqlen, host_lengths=packed.host_lengths
+        )
 
     @property
     def supports_sequence_packed_output(self) -> bool:

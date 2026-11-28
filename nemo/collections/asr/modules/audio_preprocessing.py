@@ -94,7 +94,9 @@ class AudioPreprocessor(NeuralModule, ABC):
         return processed_signal, processed_length
 
     @torch.no_grad()
-    def forward_packed(self, input_signal, length, input_signal_cu_seqlens) -> PackedEncoderActivations:
+    def forward_packed(
+        self, input_signal, length, input_signal_cu_seqlens, *, host_length=None
+    ) -> PackedEncoderActivations:
         """Preprocess concatenated waveforms into token-flat features.
 
         The packed frontend uses one vectorized guarded STFT and returns exactly
@@ -105,9 +107,13 @@ class AudioPreprocessor(NeuralModule, ABC):
             input_signal: Concatenated waveform samples with shape `(sum(length),)`.
             length: Per-waveform sample counts with shape `(B,)`.
             input_signal_cu_seqlens: Cumulative sample offsets with shape `(B + 1,)`.
+            host_length: `length` on the host (a CPU tensor or a sequence of ints), when the caller knows it,
+                for example from the data loader; the caller vouches that it equals `length`
+                and that `input_signal_cu_seqlens` is its prefix sum.
+                With it the frontend needs no device read; without it, it reads and validates `length` once.
 
         Returns:
-            Packed time-major features and their sequence metadata.
+            Packed time-major features and their sequence metadata, including a host copy of the frame counts.
         """
         if input_signal.dtype != torch.float32:
             logging.warning(
@@ -115,7 +121,9 @@ class AudioPreprocessor(NeuralModule, ABC):
                 "torch.float32. Packed preprocessing runs in float32 for numerical stability.",
                 mode=logging_mode.ONCE,
             )
-        processed = self.get_features_packed(input_signal.to(torch.float32), length, input_signal_cu_seqlens)
+        processed = self.get_features_packed(
+            input_signal.to(torch.float32), length, input_signal_cu_seqlens, host_length=host_length
+        )
         return processed.with_data(processed.data.to(self.dtype_sentinel_tensor.dtype))
 
     @abstractmethod
@@ -123,7 +131,9 @@ class AudioPreprocessor(NeuralModule, ABC):
         # Called by forward(). Subclasses should implement this.
         pass
 
-    def get_features_packed(self, input_signal, length, input_signal_cu_seqlens) -> PackedEncoderActivations:
+    def get_features_packed(
+        self, input_signal, length, input_signal_cu_seqlens, *, host_length=None
+    ) -> PackedEncoderActivations:
         raise NotImplementedError(f"{type(self).__name__} does not implement packed waveform preprocessing.")
 
 
@@ -342,8 +352,10 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
     def get_features(self, input_signal, length):
         return self.featurizer(input_signal, length)
 
-    def get_features_packed(self, input_signal, length, input_signal_cu_seqlens) -> PackedEncoderActivations:
-        return self.featurizer.forward_packed(input_signal, length, input_signal_cu_seqlens)
+    def get_features_packed(
+        self, input_signal, length, input_signal_cu_seqlens, *, host_length=None
+    ) -> PackedEncoderActivations:
+        return self.featurizer.forward_packed(input_signal, length, input_signal_cu_seqlens, host_seq_len=host_length)
 
     @property
     def filter_banks(self):

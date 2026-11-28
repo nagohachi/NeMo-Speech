@@ -235,6 +235,69 @@ class TestASRModulesBasicTests:
             preprocessor.forward_packed(packed, lengths, torch.tensor([0.0, 4.0, 6.0]))
 
     @pytest.mark.unit
+    @pytest.mark.parametrize("exact_pad", [False, True])
+    @pytest.mark.parametrize(
+        "device",
+        [
+            "cpu",
+            pytest.param(
+                "cuda",
+                marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")],
+            ),
+        ],
+    )
+    def test_AudioToMelSpectrogramPreprocessor_packed_waveform_host_length(self, exact_pad, device):
+        """Check that a host copy of the lengths sizes the frontend without a device read and changes no value;
+        the output carries the host copy of its frame counts either way."""
+        preprocessor = (
+            modules.AudioToMelSpectrogramPreprocessor(dither=0, pad_to=0, exact_pad=exact_pad, preemph=0.97)
+            .eval()
+            .to(device)
+        )
+        # empty utterances first, between two others and last: the offset of each is the next start or the end
+        lengths = torch.tensor([0, 1600, 0, 2400, 0], dtype=torch.long, device=device)
+        generator = torch.Generator(device=device).manual_seed(3)
+        audios = torch.randn(5, 2400, device=device, generator=generator)
+        audios *= torch.arange(2400, device=device)[None, :] < lengths[:, None]
+        packed = torch.cat([row[: int(length)] for row, length in zip(audios, lengths)])
+        cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)])
+        dense, dense_lengths = preprocessor(input_signal=audios, length=lengths)
+
+        expected = preprocessor.forward_packed(packed, lengths, cu_seqlens)
+        host_length = tuple(lengths.tolist())
+        if device == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            actual = preprocessor.forward_packed(packed, lengths, cu_seqlens, host_length=host_length)
+        finally:
+            if device == "cuda":
+                torch.cuda.set_sync_debug_mode("default")
+
+        assert torch.equal(actual.data, expected.data)
+        assert torch.equal(actual.lengths, dense_lengths) and torch.equal(expected.lengths, dense_lengths)
+        assert (actual.max_seqlen, actual.padded_length) == (expected.max_seqlen, expected.padded_length)
+        for out in (actual, expected):
+            assert out.host_lengths.device.type == "cpu" and torch.equal(out.host_lengths, dense_lengths.cpu())
+        for row, features in enumerate(split_encoder_output(actual)):
+            valid_length = int(dense_lengths[row])
+            torch.testing.assert_close(features, dense[row, :, :valid_length].transpose(0, 1), rtol=1e-5, atol=3e-6)
+
+    @pytest.mark.unit
+    def test_AudioToMelSpectrogramPreprocessor_packed_waveform_validates_host_length(self):
+        preprocessor = modules.AudioToMelSpectrogramPreprocessor(dither=0, pad_to=0)
+        packed = torch.zeros(6)
+        lengths = torch.tensor([4, 2], dtype=torch.long)
+        cu_seqlens = torch.tensor([0, 4, 6])
+
+        with pytest.raises(ValueError, match="sums to 5"):
+            preprocessor.forward_packed(packed, lengths, cu_seqlens, host_length=(4, 1))
+        with pytest.raises(ValueError, match="CPU copy of length"):
+            preprocessor.forward_packed(packed, lengths, cu_seqlens, host_length=(6,))
+        with pytest.raises(ValueError, match="non-negative"):
+            preprocessor.forward_packed(packed, lengths, cu_seqlens, host_length=(7, -1))
+
+    @pytest.mark.unit
     def test_AudioToMelSpectrogramPreprocessor_packed_padding_value_matches_dense_feature_stacking(self):
         preprocessor = modules.AudioToMelSpectrogramPreprocessor(
             features=8, normalize="per_feature", dither=0, pad_to=16, pad_value=-3.0

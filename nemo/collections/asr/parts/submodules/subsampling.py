@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import math
 from collections.abc import Sequence
 
@@ -108,7 +109,13 @@ class FeatureStacking(nn.Module):
         output_cu_seqlens = torch.cat(
             [output_lengths.new_zeros(1, dtype=torch.int32), output_lengths.cumsum(0, dtype=torch.int32)]
         )
-        slot_count = int(output_cu_seqlens[-1].item()) * self.subsampling_factor
+        host_output_lengths = None
+        if packed.host_lengths is not None:
+            # the same arithmetic on the host copy gives the slot count without a device read
+            host_output_lengths = self.compute_num_out_frames(packed.host_lengths)
+            slot_count = int(host_output_lengths.sum()) * self.subsampling_factor
+        else:
+            slot_count = int(output_cu_seqlens[-1].item()) * self.subsampling_factor
         slot_indices = torch.arange(slot_count, device=packed.data.device)
         slot_boundaries = output_cu_seqlens[1:].to(torch.int64) * self.subsampling_factor
         slot_sequence_ids = torch.bucketize(slot_indices, slot_boundaries, right=True)
@@ -128,7 +135,9 @@ class FeatureStacking(nn.Module):
             slots[slot_positions + local_positions] = packed.data
         stacked = slots.reshape(-1, self.proj.in_features)
         max_seqlen = self.compute_num_out_frames(packed.max_seqlen)
-        return PackedEncoderActivations.from_validated(stacked, output_lengths, output_cu_seqlens, max_seqlen)
+        return PackedEncoderActivations.from_validated(
+            stacked, output_lengths, output_cu_seqlens, max_seqlen, host_lengths=host_output_lengths
+        )
 
 
 class StackingSubsampling(torch.nn.Module):
@@ -647,28 +656,50 @@ class ConvSubsampling(torch.nn.Module):
             for parameter in self.conv.parameters():
                 anchor = anchor + parameter.sum().to(anchor.dtype) * 0.0
             empty = self.out(packed.data.new_zeros((0, self.out.in_features))) + anchor
-            return PackedEncoderActivations.from_validated(empty, packed.lengths, packed.cu_seqlens, 0)
+            return PackedEncoderActivations.from_validated(
+                empty, packed.lengths, packed.cu_seqlens, 0, host_lengths=packed.host_lengths
+            )
+        if packed.host_lengths is None:
+            # the slot count and the group boundaries are host sizes: one device read when the input carries no copy
+            packed = PackedEncoderActivations.from_validated(
+                packed.data,
+                packed.lengths,
+                packed.cu_seqlens,
+                packed.max_seqlen,
+                packed.padding_value,
+                packed.padded_length,
+                host_lengths=packed.lengths.cpu(),
+            )
         layout = packed_slot_layout(packed, alignment=self.subsampling_factor, gap=self.subsampling_factor)
+        host_lengths = packed.host_lengths
+        slot_lengths = layout.host_slot_lengths.tolist()
+        host_slot_offsets = [0, *itertools.accumulate(slot_lengths)]
+        host_cu_seqlens = [0, *itertools.accumulate(host_lengths.tolist())]
         outputs = []
         lengths = []
+        host_out_lengths = []
         for first, last in self._packed_sequence_groups(layout):
-            group_slots = int((layout.slot_offsets[last - 1] + layout.slot_lengths[last - 1]).item()) - int(
-                layout.slot_offsets[first].item()
-            )
-            start, end = int(packed.cu_seqlens[first].item()), int(packed.cu_seqlens[last].item())
-            data, out_lengths = self._forward_packed_group(
+            start, end = host_cu_seqlens[first], host_cu_seqlens[last]
+            data, out_lengths, host_group_out_lengths = self._forward_packed_group(
                 packed.data[start:end],
                 packed.lengths[first:last],
+                host_lengths[first:last],
                 layout.slot_offsets[first:last] - layout.slot_offsets[first],
                 layout.token_slots[start:end] - layout.slot_offsets[first],
-                group_slots,
+                host_slot_offsets[last] - host_slot_offsets[first],
             )
             outputs.append(data)
             lengths.append(out_lengths)
+            host_out_lengths.append(host_group_out_lengths)
         out_lengths = torch.cat(lengths).to(torch.int64)
-        max_seqlen = int(out_lengths.max().item()) if out_lengths.numel() else 0
+        host_out_lengths = torch.cat(host_out_lengths)
+        max_seqlen = int(host_out_lengths.max()) if out_lengths.numel() else 0
         return PackedEncoderActivations.from_validated(
-            torch.cat(outputs), out_lengths, lengths_to_cu_seqlens(out_lengths), max_seqlen
+            torch.cat(outputs),
+            out_lengths,
+            lengths_to_cu_seqlens(out_lengths),
+            max_seqlen,
+            host_lengths=host_out_lengths,
         )
 
     def sequence_packed_unsupported_reason(self) -> str | None:
@@ -711,6 +742,7 @@ class ConvSubsampling(torch.nn.Module):
 
         The padded forward splits the batch for the same reason (``subsampling_conv_chunking_factor``);
         here a group is a run of utterances, and a group boundary is exact because the slots are independent.
+        The slot lengths are read from ``layout.host_slot_lengths``, which ``forward_packed`` always provides.
         """
         batch_size = layout.slot_lengths.numel()
         if batch_size == 0:
@@ -730,9 +762,8 @@ class ConvSubsampling(torch.nn.Module):
             return [(0, batch_size)]
         groups = []
         first = 0
-        slot_lengths = layout.slot_lengths.tolist()
         current = 0
-        for index, slots in enumerate(slot_lengths):
+        for index, slots in enumerate(layout.host_slot_lengths.tolist()):
             if current and current + slots > slot_limit:
                 groups.append((first, index))
                 first, current = index, 0
@@ -744,26 +775,36 @@ class ConvSubsampling(torch.nn.Module):
         self,
         data: torch.Tensor,
         lengths: torch.Tensor,
+        host_lengths: torch.Tensor,
         slot_offsets: torch.Tensor,
         token_slots: torch.Tensor,
         total_slots: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The convolution stack over one gapped time axis; returns the valid output frames and their lengths."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the convolution stack over one gapped time axis.
+
+        ``host_lengths`` is a CPU copy of ``lengths``; the output lengths are computed on both sides,
+        so that the output size needs no device read.
+        Returns the valid output frames, their lengths, and a CPU copy of the lengths.
+        """
         x = data.new_zeros((total_slots, data.shape[1])).index_copy(0, token_slots, data)
         x = x.view(1, 1, total_slots, -1)
         current_lengths = lengths.to(torch.int64)
+        host_current_lengths = host_lengths.to(torch.int64)
         current_offsets = slot_offsets
         for layer in self.conv:
             x = x * self._packed_stage_mask(x, current_offsets, current_lengths)
             x = layer(x)
             if hasattr(layer, 'stride') and layer.stride != (1, 1):
-                current_lengths = calculate_conv_output_size(
-                    current_lengths, layer.kernel_size[0], layer.stride[0], _layer_padding(layer)
+                current_lengths, host_current_lengths = (
+                    calculate_conv_output_size(value, layer.kernel_size[0], layer.stride[0], _layer_padding(layer)).to(
+                        torch.int64
+                    )
+                    for value in (current_lengths, host_current_lengths)
                 )
                 current_offsets = torch.div(current_offsets, layer.stride[0], rounding_mode='floor')
         x = x * self._packed_stage_mask(x, current_offsets, current_lengths)
 
-        total_out = int(current_lengths.sum().item())
+        total_out = int(host_current_lengths.sum())
         out_sequence_ids = torch.repeat_interleave(
             torch.arange(current_lengths.numel(), device=x.device), current_lengths, output_size=total_out
         )
@@ -772,7 +813,7 @@ class ConvSubsampling(torch.nn.Module):
         out_slots = current_offsets[out_sequence_ids] + out_positions
         # the padded forward flattens channels before frequency bins
         x = x.squeeze(0).permute(1, 0, 2).reshape(x.shape[2], -1).index_select(0, out_slots)
-        return self.out(x), current_lengths
+        return self.out(x), current_lengths, host_current_lengths
 
     @staticmethod
     def _packed_stage_mask(x: torch.Tensor, slot_offsets: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:

@@ -21,7 +21,7 @@ import torch
 from omegaconf import ListConfig
 
 from nemo.collections.asr.models import ASRModel
-from nemo.collections.asr.parts.packed_sequence import pack_encoder_output
+from nemo.collections.asr.parts.packed_sequence import PackedEncoderActivations, pack_encoder_output
 from nemo.collections.asr.parts.submodules import subsampling as subsampling_module
 from nemo.collections.asr.parts.submodules.subsampling import (
     ConvSubsampling,
@@ -502,6 +502,29 @@ class TestPackedConvSubsampling:
         grouped = module.forward_packed(packed)
         torch.testing.assert_close(grouped.data, whole.data)
         assert grouped.lengths.tolist() == whole.lengths.tolist()
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize("chunking_factor", [1, 2])
+    def test_output_host_lengths(self, chunking_factor):
+        """Check that the output carries a host copy of its lengths, computed as the device lengths are;
+        an input without a host copy (one device read) gives the same result."""
+        module = ConvSubsampling("dw_striding", 8, 8, 12, 4).double()
+        module.subsampling_conv_chunking_factor = chunking_factor
+        lengths = torch.tensor([37, 1, 12, 0, 36, 6])
+        with_host_lengths = pack_encoder_output(_packed_test_features(lengths), lengths)
+        without_host_lengths = PackedEncoderActivations.from_validated(
+            with_host_lengths.data,
+            with_host_lengths.lengths,
+            with_host_lengths.cu_seqlens,
+            with_host_lengths.max_seqlen,
+        )
+        expected = module.forward_packed(without_host_lengths)
+        actual = module.forward_packed(with_host_lengths)
+        torch.testing.assert_close(actual.data, expected.data, rtol=0, atol=0)
+        for out in (actual, expected):
+            assert out.host_lengths.device.type == "cpu"
+            assert torch.equal(out.host_lengths, out.lengths)
+            assert out.max_seqlen == int(out.lengths.max())
 
     @pytest.mark.unit
     def test_rejects_unsupported_stacks(self):

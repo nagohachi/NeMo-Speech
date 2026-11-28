@@ -659,6 +659,21 @@ class TestPackedConformerEncoder:
             encoder.forward_sequence_packed(pack_encoder_output(features.transpose(1, 2), lengths), lengths - 1)
 
     @pytest.mark.unit
+    def test_output_carries_the_host_lengths(self):
+        """Check that the output carries the host copy of its lengths: computed by the subsampling, passed on
+        without one."""
+        lengths = torch.tensor([20, 13])
+        features = pack_encoder_output(_packed_test_features(lengths).transpose(1, 2), lengths)
+        out = _packed_encoder().double().eval().forward_sequence_packed(features)
+        assert out.host_lengths.device.type == "cpu" and torch.equal(out.host_lengths, out.lengths)
+        encoder = _packed_encoder(pre_encode=None, subsampling_factor=1).double().eval()
+        assert torch.equal(encoder.forward_sequence_packed(features).host_lengths, lengths)
+        without_host_lengths = PackedEncoderActivations.from_validated(
+            features.data, features.lengths, features.cu_seqlens, features.max_seqlen
+        )
+        assert encoder.forward_sequence_packed(without_host_lengths).host_lengths is None
+
+    @pytest.mark.unit
     def test_output_padding_is_zero_whatever_the_input_padding(self):
         """Normalized packed features carry a (B, feat_in) padding tensor; the encoder output pads with zeros."""
         torch.manual_seed(5)
