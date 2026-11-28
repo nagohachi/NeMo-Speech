@@ -20,6 +20,9 @@ from functools import lru_cache
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from nemo.core.utils.optional_libs import is_lib_available
+from nemo.utils import logging
+
 _flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
 
 
@@ -132,7 +135,15 @@ def _get_flash_attention_varlen_for_device(device):
 
 def _get_flash_attention_varlen():
     """Return the external or ATen variable-length FlashAttention implementation, or ``None`` without one."""
-    return _FLASH_ATTENTION_VARLEN
+    # torch.compile traces this lookup inside compiled packed layers and cannot trace an import that fails, so
+    # flash-attn is imported only when find_spec found it at module import (_FLASH_ATTN_INSTALLED)
+    if _FLASH_ATTN_INSTALLED:
+        flash_attn_varlen_func = _import_flash_attn_varlen()
+        if flash_attn_varlen_func is not None:
+            return flash_attn_varlen_func
+    if getattr(torch.ops.aten, "_flash_attention_forward", None) is None:
+        return None
+    return _run_torch_flash_attention_varlen
 
 
 def _run_torch_flash_attention_varlen(
@@ -181,19 +192,15 @@ def _forward_sequence_packed_layer(layer, x, **kwargs):
     return checkpoint_fn(packed_forward, x, **kwargs)
 
 
-def _resolve_flash_attention_varlen():
-    """Import the external variable-length FlashAttention, falling back to the ATen operator."""
+@lru_cache(maxsize=1)
+def _import_flash_attn_varlen():
+    """Import ``flash_attn_varlen_func`` from flash-attn, or return ``None`` for a build that cannot be imported."""
     try:
         from flash_attn import flash_attn_varlen_func
-
-        return flash_attn_varlen_func
-    except ImportError:  # not installed, or an installed build that cannot be imported
-        pass
-    if getattr(torch.ops.aten, "_flash_attention_forward", None) is None:
+    except Exception as error:  # ImportError, or OSError / RuntimeError from a CUDA extension built for another ABI
+        logging.warning(f"flash-attn is installed but cannot be imported ({error}); using the ATen FlashAttention.")
         return None
-    return _run_torch_flash_attention_varlen
+    return flash_attn_varlen_func
 
 
-# Resolved once at import rather than on first use: torch.compile traces _get_flash_attention_varlen inside compiled
-# packed layers (ignoring any lru_cache), and an import that fails while tracing breaks the graph.
-_FLASH_ATTENTION_VARLEN = _resolve_flash_attention_varlen()
+_FLASH_ATTN_INSTALLED = is_lib_available("flash_attn")

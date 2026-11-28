@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import builtins
 import copy
 import gc
 import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -438,40 +440,81 @@ def test_sequence_packed_flash_device_probe_is_cached(monkeypatch):
         transformer_encoder_utils_module._get_flash_attention_varlen_for_device.cache_clear()
 
 
-def test_flash_attention_varlen_falls_back_to_aten_when_flash_attn_cannot_be_imported(monkeypatch):
-    """Check that a missing or broken flash-attn resolves to the ATen provider."""
-    if getattr(torch.ops.aten, "_flash_attention_forward", None) is None:
-        pytest.skip("PyTorch build does not expose the ATen FlashAttention operator")
-    monkeypatch.setitem(sys.modules, "flash_attn", None)  # makes `import flash_attn` raise ImportError
-    provider = transformer_encoder_utils_module._resolve_flash_attention_varlen()
+def test_flash_attention_varlen_uses_aten_without_flash_attn(monkeypatch):
+    """Check that without flash-attn the ATen provider is used, without importing flash-attn."""
+    _skip_without_aten_flash_attention()
+    monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", False)
+    monkeypatch.setattr(transformer_encoder_utils_module, "_import_flash_attn_varlen", _fail_on_import)
+    provider = transformer_encoder_utils_module._get_flash_attention_varlen()
     assert provider is transformer_encoder_utils_module._run_torch_flash_attention_varlen
     assert provider._sequence_packed_provider == "aten"
 
 
+@pytest.mark.parametrize("import_error", [ImportError, OSError])
+def test_flash_attention_varlen_falls_back_to_aten_for_a_broken_flash_attn(monkeypatch, import_error):
+    """Check that an installed flash-attn whose import fails, also with an error other than ImportError, falls
+    back to the ATen provider."""
+    _skip_without_aten_flash_attention()
+    original_import = builtins.__import__
+
+    def import_broken_flash_attn(name, *args, **kwargs):
+        if name == "flash_attn":
+            raise import_error("undefined symbol")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", True)
+    monkeypatch.setattr(builtins, "__import__", import_broken_flash_attn)
+    transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
+    try:
+        provider = transformer_encoder_utils_module._get_flash_attention_varlen()
+    finally:
+        transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
+    assert provider is transformer_encoder_utils_module._run_torch_flash_attention_varlen
+
+
 def test_flash_attention_varlen_prefers_flash_attn(monkeypatch):
-    """Check that an importable flash-attn provides the varlen implementation."""
+    """Check that an installed flash-attn provides the varlen implementation."""
+    monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", True)
+    monkeypatch.setitem(sys.modules, "flash_attn", _make_fake_flash_attn_module())
+    transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
+    try:
+        assert transformer_encoder_utils_module._get_flash_attention_varlen() is _fake_flash_attn_varlen
+    finally:
+        transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
 
-    def flash_attn_varlen_func(*args, **kwargs):
-        raise AssertionError("not called")
 
-    monkeypatch.setitem(sys.modules, "flash_attn", SimpleNamespace(flash_attn_varlen_func=flash_attn_varlen_func))
-    assert transformer_encoder_utils_module._resolve_flash_attention_varlen() is flash_attn_varlen_func
-
-
-def test_flash_attention_varlen_lookup_has_no_graph_break(monkeypatch):
-    """Check that torch.compile traces the provider lookup of compiled packed layers into one graph,
-    also when flash-attn cannot be imported."""
-    monkeypatch.setitem(sys.modules, "flash_attn", None)  # makes `import flash_attn` raise ImportError
-    torch._dynamo.reset()
+@pytest.mark.parametrize("flash_attn_installed", [False, True])
+def test_flash_attention_varlen_device_lookup_compiles_into_one_graph(monkeypatch, flash_attn_installed):
+    """Check that torch.compile traces the provider lookup that compiled packed layers call,
+    ``_get_flash_attention_varlen_for_device``, into one graph, with flash-attn unimportable or installed."""
+    if not flash_attn_installed:
+        _skip_without_aten_flash_attention()
+    monkeypatch.setattr(torch.version, "cuda", "12.8")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    # raising=False: the lookup before this fix has no _FLASH_ATTN_INSTALLED and imports flash-attn while tracing
+    monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", flash_attn_installed, raising=False)
+    monkeypatch.setitem(sys.modules, "flash_attn", _make_fake_flash_attn_module() if flash_attn_installed else None)
+    expected_provider = (
+        _fake_flash_attn_varlen
+        if flash_attn_installed
+        else transformer_encoder_utils_module._run_torch_flash_attention_varlen
+    )
+    device = torch.device("cuda:0")
+    providers = []
 
     def add_provider_flag(x):
-        return x + (transformer_encoder_utils_module._get_flash_attention_varlen() is not None)
+        provider = transformer_encoder_utils_module._get_flash_attention_varlen_for_device(device)
+        providers.append(provider)
+        return x + (provider is not None)
 
+    _clear_flash_attention_caches()
+    torch._dynamo.reset()
     try:
-        expected = torch.ones(1) * (transformer_encoder_utils_module._get_flash_attention_varlen() is not None)
-        torch.testing.assert_close(torch.compile(add_provider_flag, fullgraph=True)(torch.zeros(1)), expected)
+        torch.testing.assert_close(torch.compile(add_provider_flag, fullgraph=True)(torch.zeros(1)), torch.ones(1))
     finally:
         torch._dynamo.reset()
+        _clear_flash_attention_caches()
+    assert providers == [expected_provider]
 
 
 def test_sequence_packed_adds_no_state_dict_keys_and_loads_strictly():
@@ -674,3 +717,34 @@ def test_packed_encoder_output_detach_and_cpu_keep_metadata():
     packed = pack_encoder_output(data.unsqueeze(0), torch.tensor([3]))
     detached = packed.detach().cpu()
     assert not detached.data.requires_grad and detached.lengths.tolist() == [3] and detached.max_seqlen == 3
+
+
+def _skip_without_aten_flash_attention():
+    """Skip the test when PyTorch has no ATen FlashAttention operator."""
+    if getattr(torch.ops.aten, "_flash_attention_forward", None) is None:
+        pytest.skip("PyTorch build does not expose the ATen FlashAttention operator")
+
+
+def _clear_flash_attention_caches():
+    """Clear the cached device probe and, where it exists, the cached flash-attn import."""
+    transformer_encoder_utils_module._get_flash_attention_varlen_for_device.cache_clear()
+    import_flash_attn_varlen = getattr(transformer_encoder_utils_module, "_import_flash_attn_varlen", None)
+    if import_flash_attn_varlen is not None:
+        import_flash_attn_varlen.cache_clear()
+
+
+def _fail_on_import():
+    """Stand in for the flash-attn import in tests where it must not happen."""
+    raise AssertionError("flash-attn was imported")
+
+
+def _make_fake_flash_attn_module():
+    """Return a module that stands in for an installed flash-attn."""
+    module = types.ModuleType("flash_attn")
+    module.flash_attn_varlen_func = _fake_flash_attn_varlen
+    return module
+
+
+def _fake_flash_attn_varlen(*args, **kwargs):
+    """Stand in for flash_attn.flash_attn_varlen_func, which the lookup returns without calling."""
+    raise AssertionError("not called")
