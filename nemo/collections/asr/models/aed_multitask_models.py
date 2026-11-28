@@ -1661,11 +1661,6 @@ def _check_packed_training_config(model_config: DictConfig, train_data_config: O
             "train_ds.pack_sequences: loss.predict_last_k would keep the last tokens of the whole packed batch, "
             "not of each utterance. Set loss.predict_last_k to 0."
         )
-    if model_config.get("train_batch_metrics", True):
-        raise ValueError(
-            "train_ds.pack_sequences: the sequence-packed training step does not decode its batch, so it logs no "
-            "training_batch metrics. Set train_batch_metrics: false."
-        )
 
 
 def _refuse_sequence_packing(config, name: str):

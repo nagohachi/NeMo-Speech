@@ -416,9 +416,8 @@ def test_evaluation_data_refuses_sequence_packing(asr_model, name):
 @pytest.mark.parametrize(
     "setting,match",
     [
-        ({}, "train_batch_metrics"),
-        ({"train_batch_metrics": False, "loss": {"predict_last_k": 2}}, "predict_last_k"),
-        ({"train_batch_metrics": False, "transf_encoder": {"num_layers": 1}}, "transf_encoder"),
+        ({"loss": {"predict_last_k": 2}}, "predict_last_k"),
+        ({"transf_encoder": {"num_layers": 1}}, "transf_encoder"),
     ],
 )
 def test_packed_training_refuses_unsupported_settings(asr_model, setting, match):
@@ -439,9 +438,6 @@ def test_packed_training_loader_through_model_setup(tmp_path, monkeypatch, asr_m
     path = _save_cuts(cuts, tmp_path)
     warnings = []
     monkeypatch.setattr(lhotse_dataloader.logging, "warning", lambda msg, *args, **kwargs: warnings.append(str(msg)))
-    with open_dict(asr_model.cfg):
-        asr_model.cfg.train_batch_metrics = False
-
     asr_model.setup_training_data(_make_loader_config(path, pin_memory=False))
     batch = next(iter(asr_model._train_dl))
 
@@ -459,9 +455,6 @@ def test_packed_training_loader_through_model_setup(tmp_path, monkeypatch, asr_m
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinning needs CUDA")
 def test_packed_training_loader_pins_memory(tmp_path, asr_model, cuts):
     path = _save_cuts(cuts, tmp_path)
-    with open_dict(asr_model.cfg):
-        asr_model.cfg.train_batch_metrics = False
-
     asr_model.setup_training_data(_make_loader_config(path, pin_memory=True))
     batch = next(iter(asr_model._train_dl))
 
