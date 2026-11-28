@@ -499,8 +499,7 @@ def test_flash_attention_varlen_device_lookup_compiles_into_one_graph(monkeypatc
         _skip_without_aten_flash_attention()
     monkeypatch.setattr(torch.version, "cuda", "12.8")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
-    # raising=False: the lookup before this fix has no _FLASH_ATTN_INSTALLED and imports flash-attn while tracing
-    monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", flash_attn_installed, raising=False)
+    monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", flash_attn_installed)
     monkeypatch.setitem(sys.modules, "flash_attn", _make_fake_flash_attn_module() if flash_attn_installed else None)
     expected_provider = (
         _fail_on_flash_attn_varlen_call
@@ -734,11 +733,9 @@ def _skip_without_aten_flash_attention():
 
 
 def _clear_flash_attention_caches():
-    """Clear the cached device probe and, where it exists, the cached flash-attn import."""
+    """Clear the cached device probe and the cached flash-attn import."""
     transformer_encoder_utils_module._get_flash_attention_varlen_for_device.cache_clear()
-    import_flash_attn_varlen = getattr(transformer_encoder_utils_module, "_import_flash_attn_varlen", None)
-    if import_flash_attn_varlen is not None:
-        import_flash_attn_varlen.cache_clear()
+    transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
 
 
 def _fail_on_import():
