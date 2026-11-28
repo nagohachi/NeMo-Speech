@@ -95,6 +95,18 @@ def test_int16_rows_refuse_a_file_that_differs_from_its_recording(tmp_path, faul
 
 @pytest.mark.unit
 @pytest.mark.parametrize("fault_tolerant", [False, True])
+def test_int16_rows_refuse_a_stereo_file_that_its_recording_declares_mono(tmp_path, fault_tolerant):
+    """Check that a stereo file behind a recording that declares one channel raises, also when the reader drops
+    unreadable cuts."""
+    path = tmp_path / "stereo.wav"
+    soundfile.write(path, np.zeros((8000, 2), dtype=np.int16), SAMPLING_RATE, subtype="PCM_16")
+    cut = _make_recording(path, num_samples=8000).to_cut()
+    with pytest.raises(ValueError, match=r"2 channel\(s\) at 16000 Hz, the recording declares 1 channel"):
+        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(fault_tolerant=fault_tolerant), dtype=torch.int16)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fault_tolerant", [False, True])
 def test_int16_rows_refuse_cuts_they_cannot_read_exactly(tmp_path, fault_tolerant):
     """Check that a stereo recording, a file inside a tar archive and cuts without a recording of their own raise,
     also when the reader drops unreadable cuts."""
