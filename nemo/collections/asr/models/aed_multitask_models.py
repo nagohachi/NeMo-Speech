@@ -232,9 +232,9 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         # Optional auxiliary CTC loss on the encoder output (hybrid CTC/attention training):
         # the training loss becomes (1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss.
         # The CTC targets are the transcript tokens without the prompt, which the prompt formats end without EOS.
-        aux_ctc = self.cfg.get("aux_ctc") or {}
-        _check_aux_ctc_config(aux_ctc)
-        self.ctc_loss_weight = float(aux_ctc.get("ctc_loss_weight", 0.0))
+        aux_ctc_config = self.cfg.get("aux_ctc") or {}
+        _check_aux_ctc_config(aux_ctc_config)
+        self.ctc_loss_weight = float(aux_ctc_config.get("ctc_loss_weight", 0.0))
         if self.ctc_loss_weight > 0:
             self._setup_aux_ctc(vocab_size)
 
@@ -1530,22 +1530,26 @@ def parse_multitask_prompt(prompt: dict | None) -> list[dict]:
     return [dict(role=role, slots=prompt)]
 
 
-def _check_aux_ctc_config(aux_ctc) -> None:
+def _check_aux_ctc_config(aux_ctc_config) -> None:
     """Raise ``ValueError`` for an ``aux_ctc`` config that ``EncDecMultiTaskModel`` cannot apply as written."""
-    if unsupported := set(aux_ctc) - {"ctc_loss_weight", "ctc_reduction", "zero_infinity"}:
+    if unsupported := set(aux_ctc_config) - {"ctc_loss_weight", "ctc_reduction", "zero_infinity"}:
         raise ValueError(
             f"aux_ctc has keys that EncDecMultiTaskModel does not read: {sorted(unsupported)}. Its CTC head is a "
             "ConvASRDecoder on the encoder output; set only ctc_loss_weight, ctc_reduction and zero_infinity."
         )
-    weight = aux_ctc.get("ctc_loss_weight", 0.0)
-    if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not 0 <= weight <= 1:
-        raise ValueError(f"aux_ctc.ctc_loss_weight must be a number between 0 and 1, got {weight!r}.")
-    if weight == 0 and (unused := set(aux_ctc) & {"ctc_reduction", "zero_infinity"}):
+    ctc_loss_weight = aux_ctc_config.get("ctc_loss_weight", 0.0)
+    if (
+        isinstance(ctc_loss_weight, bool)
+        or not isinstance(ctc_loss_weight, (int, float))
+        or not 0 <= ctc_loss_weight <= 1
+    ):
+        raise ValueError(f"aux_ctc.ctc_loss_weight must be a number between 0 and 1, got {ctc_loss_weight!r}.")
+    if ctc_loss_weight == 0 and (unused := set(aux_ctc_config) & {"ctc_reduction", "zero_infinity"}):
         raise ValueError(f"aux_ctc sets {sorted(unused)}, which apply only with ctc_loss_weight > 0.")
-    reduction = aux_ctc.get("ctc_reduction", "mean_volume")
+    reduction = aux_ctc_config.get("ctc_reduction", "mean_volume")
     if reduction not in ("mean_volume", "mean_batch", "mean", "sum"):
         raise ValueError(
             f"aux_ctc.ctc_reduction must be one of mean_volume, mean_batch, mean or sum, got {reduction!r}."
         )
-    if not isinstance(aux_ctc.get("zero_infinity", False), bool):
-        raise ValueError(f"aux_ctc.zero_infinity must be a bool, got {aux_ctc.get('zero_infinity')!r}.")
+    if not isinstance(aux_ctc_config.get("zero_infinity", False), bool):
+        raise ValueError(f"aux_ctc.zero_infinity must be a bool, got {aux_ctc_config.get('zero_infinity')!r}.")

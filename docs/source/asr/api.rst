@@ -63,6 +63,9 @@ The CTC targets are the transcript tokens without the prompt; the Canary prompt 
 
 ``ctc_reduction`` and ``zero_infinity`` require a positive ``ctc_loss_weight``.
 
+The CTC head serves only as this auxiliary training loss: validation and inference (``transcribe``) use the attention decoder alone,
+so ``val_loss`` is the attention loss, comparable with the logged ``train_attn_loss`` rather than with the mixed ``train_loss``.
+
 
 .. _asr-api-modules:
 

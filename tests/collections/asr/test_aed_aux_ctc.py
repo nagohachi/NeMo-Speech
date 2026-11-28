@@ -69,6 +69,21 @@ def make_asr_model_ctc(asr_model):
 
 
 @pytest.mark.unit
+def test_validation_loss_is_the_attention_loss_without_ctc(asr_model_ctc, cuts, monkeypatch):
+    """Check that val_loss of a model with aux_ctc is the attention loss alone: the training loss of the same batch
+    with the CTC weight set to 0, not the mixed training loss."""
+    asr_model_ctc.eval()
+    batch = _make_padded_dataset(asr_model_ctc)[cuts]
+    with torch.no_grad():
+        val_loss = asr_model_ctc.validation_pass(batch, batch_idx=0)["val_loss"]
+        mixed_loss = asr_model_ctc.training_step(batch, batch_nb=0)["loss"]
+        monkeypatch.setattr(asr_model_ctc, "ctc_loss_weight", 0.0)
+        attention_loss = asr_model_ctc.training_step(batch, batch_nb=0)["loss"]
+    torch.testing.assert_close(val_loss, attention_loss)
+    assert not torch.allclose(val_loss, mixed_loss)
+
+
+@pytest.mark.unit
 def test_padded_training_step_mixes_attention_and_ctc_losses(asr_model_ctc, cuts):
     """Check that the padded step trains on 0.7 * attention loss + 0.3 * CTC loss, the CTC loss computed here
     from the encoder output, and that the CTC head gets gradients."""
