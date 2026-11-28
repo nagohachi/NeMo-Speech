@@ -138,6 +138,24 @@ class TestTransformerDecoderBlockComposition:
         assert isinstance(decoder.embedding.layer_norm, torch.nn.LayerNorm)
 
     @pytest.mark.unit
+    @pytest.mark.parametrize("compile_packed_layers", [True, False, None])
+    def test_compile_packed_layers_from_config_dict(self, compile_packed_layers):
+        """Check that get_nemo_transformer passes compile_packed_layers of the config dict, which the example YAML
+        sets, on to the decoder, and that it defaults to False."""
+        config = {
+            "vocab_size": 11,
+            "hidden_size": 16,
+            "num_layers": 1,
+            "inner_size": 24,
+            "num_attention_heads": 2,
+            "max_sequence_length": 32,
+        }
+        if compile_packed_layers is not None:
+            config["compile_packed_layers"] = compile_packed_layers
+        decoder = get_nemo_transformer(config_dict=DictConfig(config), encoder=False)
+        assert decoder.decoder.compile_packed_layers is bool(compile_packed_layers)
+
+    @pytest.mark.unit
     def test_rms_norm(self):
         torch.manual_seed(0)
         norm = RMSNorm(8, eps=1e-6)
