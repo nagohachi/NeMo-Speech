@@ -846,7 +846,7 @@ class ConvSubsampling(torch.nn.Module):
         """
         conv0 = self.conv[0]
         x = data.new_zeros((total_slots, data.shape[1])).index_copy(0, token_slots, data).view(1, 1, total_slots, -1)
-        current_lengths, host_current, current_offsets = _advance_packed_stage(
+        current_lengths, host_current_lengths, current_offsets = _advance_packed_stage(
             conv0, lengths.to(torch.int64), host_lengths.to(torch.int64), slot_offsets
         )
         if data.requires_grad:
@@ -871,8 +871,8 @@ class ConvSubsampling(torch.nn.Module):
                 torch.full((1,), total_slots, dtype=torch.int64, device=x.device),
                 relu_out_valid_mask=stage_valid_mask,
             )
-            current_lengths, host_current, current_offsets = _advance_packed_stage(
-                first_depthwise, current_lengths, host_current, current_offsets
+            current_lengths, host_current_lengths, current_offsets = _advance_packed_stage(
+                first_depthwise, current_lengths, host_current_lengths, current_offsets
             )
             batch, height, width, channels = x.shape
             x = nn.functional.linear(x.view(-1, channels), first_pointwise.weight.flatten(1), first_pointwise.bias)
@@ -883,8 +883,8 @@ class ConvSubsampling(torch.nn.Module):
             # the ReLU of the previous stage and the mask of this depthwise input, one pass over the largest tensors
             x = _compile_relu_mask()(x, _make_packed_stage_mask_channels_last(x, current_offsets, current_lengths))
             whole_row_in_lengths = torch.full((1,), x.shape[1], dtype=torch.int64, device=x.device)
-            current_lengths, host_current, current_offsets = _advance_packed_stage(
-                depthwise, current_lengths, host_current, current_offsets
+            current_lengths, host_current_lengths, current_offsets = _advance_packed_stage(
+                depthwise, current_lengths, host_current_lengths, current_offsets
             )
             out_height = calculate_conv_output_size(
                 x.shape[1], depthwise.kernel_size[0], depthwise.stride[0], _layer_padding(depthwise)
@@ -905,7 +905,7 @@ class ConvSubsampling(torch.nn.Module):
             x = x.view(batch, height, width, -1)
         x = torch.relu(x)  # the activation of the last stage, which no depthwise convolution reads
 
-        total_out = int(host_current.sum())
+        total_out = int(host_current_lengths.sum())
         out_sequence_ids = torch.repeat_interleave(
             torch.arange(current_lengths.numel(), device=x.device), current_lengths, output_size=total_out
         )
@@ -914,7 +914,7 @@ class ConvSubsampling(torch.nn.Module):
         out_slots = current_offsets[out_sequence_ids] + out_positions
         # the valid frames, flattened channels before frequency bins as in the padded forward
         x = x[0].index_select(0, out_slots).transpose(1, 2).reshape(total_out, -1)
-        return self.out(x), current_lengths, host_current
+        return self.out(x), current_lengths, host_current_lengths
 
     @staticmethod
     def _packed_stage_mask(x: torch.Tensor, slot_offsets: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
