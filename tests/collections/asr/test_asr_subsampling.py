@@ -587,13 +587,11 @@ class TestPackedConvSubsampling:
         torch.testing.assert_close(subsampling_module._run_single_channel_conv_channels_last(x, conv), expected)
 
     @pytest.mark.unit
-    def test_triton_stack_does_not_run_on_cpu_or_without_fuse_triton(self):
-        """Check that the Triton kernels are chosen for CUDA input only, and only with fuse_triton."""
+    def test_triton_stack_does_not_run_on_cpu(self):
+        """Check that a stack built for the Triton kernels does not choose them for CPU input."""
         stack = ConvSubsampling("dw_striding", 8, 8, 12, 4, use_triton=True).conv
+        assert stack.fuse_triton
         assert not stack.can_run_triton(torch.zeros(1))
-        stack.fuse_triton = False
-        if torch.cuda.is_available():
-            assert not stack.can_run_triton(torch.zeros(1, device="cuda"))
 
     @pytest.mark.unit
     def test_rejects_unsupported_stacks(self):
@@ -635,6 +633,27 @@ class TestPackedConvSubsamplingChannelsLast:
     padded forward masked by the utterances' slots (or, for an input that needs a gradient, the first convolution as a
     matmul over the unfolded patches), the other depthwise convolutions in the Triton kernel of the padded forward,
     the ReLU and the mask of a depthwise input in one compiled kernel. It computes the function of the generic path."""
+
+    @pytest.mark.unit
+    def test_triton_stack_runs_on_cuda_only_where_the_kernels_apply(self, monkeypatch):
+        """Check that the Triton kernels are chosen for CUDA input, and not without fuse_triton, with deterministic
+        algorithms or while exporting."""
+        stack = ConvSubsampling("dw_striding", 8, 8, 12, 4, use_triton=True).conv
+        x = torch.zeros(1, device="cuda")
+        assert stack.can_run_triton(x)
+        with monkeypatch.context() as patch:
+            patch.setattr(stack, "fuse_triton", False)
+            assert not stack.can_run_triton(x)
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.compiler, "is_exporting", lambda: True)
+            assert not stack.can_run_triton(x)
+        deterministic = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+        try:
+            assert not stack.can_run_triton(x)
+        finally:
+            torch.use_deterministic_algorithms(deterministic)
+        assert stack.can_run_triton(x)
 
     @pytest.mark.unit
     @pytest.mark.parametrize("input_grad", [False, True], ids=["fused_first_stage", "unfolded_first_stage"])
