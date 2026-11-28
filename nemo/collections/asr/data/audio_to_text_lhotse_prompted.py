@@ -15,7 +15,7 @@
 import dataclasses
 import os
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import torch.utils.data
 from lhotse import CutSet
@@ -169,16 +169,7 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
             # Adding this to allow gathering results of the same audio from different batches
             if cuts[0].start != 0:
                 cuts[0].id = cuts[0].id + '_cut_segmented'
-        # Fast-path: the tokenization and prompt format ting was already done before sampling.
-        attrs = ("input_ids", "context_ids", "answer_ids")
-        pre_formatted = all(hasattr(c, a) for c in cuts for a in attrs)
-        if pre_formatted:
-            prompts_with_answers, prompts, answers = zip(*((c.input_ids, c.context_ids, c.answer_ids) for c in cuts))
-        else:
-            formatted = [apply_prompt_format_fn(cut, self.prompt) for cut in cuts]
-            prompts_with_answers = [ex["input_ids"] for ex in formatted]
-            prompts = [ex["context_ids"] for ex in formatted]
-            answers = [ex["answer_ids"] for ex in formatted]
+        prompts_with_answers, prompts, answers = self._get_prompted_token_ids(cuts)
 
         transcript, transcript_lens = self._collate_tokens(answers)
         prompts_with_answers, prompts_with_answers_lens = self._collate_tokens(prompts_with_answers)
@@ -210,17 +201,10 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
         torch.cumsum(audio_lens, dim=0, out=audio_cu_seqlens[1:])
         audio = torch.cat(rows)
 
-        prompted_ids, prompt_lens, answers = [], [], []
-        for cut in cuts:
-            if all(hasattr(cut, a) for a in ("input_ids", "context_ids", "answer_ids")):
-                input_ids, context_ids, answer_ids = cut.input_ids, cut.context_ids, cut.answer_ids
-            else:
-                formatted = apply_prompt_format_fn(cut, self.prompt)
-                input_ids, context_ids = formatted["input_ids"], formatted["context_ids"]
-                answer_ids = formatted["answer_ids"]
-            prompted_ids.append(torch.as_tensor(input_ids, dtype=torch.long))
-            prompt_lens.append(len(context_ids))
-            answers.append(torch.as_tensor(answer_ids, dtype=torch.long))
+        prompts_with_answers, prompts, answers = self._get_prompted_token_ids(cuts)
+        prompted_ids = [torch.as_tensor(ids, dtype=torch.long) for ids in prompts_with_answers]
+        prompt_lens = [len(ids) for ids in prompts]
+        answers = [torch.as_tensor(ids, dtype=torch.long) for ids in answers]
         if any(seq.numel() < 2 for seq in prompted_ids):
             raise ValueError("Every prompted transcript needs at least two tokens for teacher forcing.")
         transcript, transcript_lens = self._collate_tokens(answers)
@@ -237,6 +221,23 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
             max_decoder_len=max(seq.numel() - 1 for seq in prompted_ids),
             cuts=_drop_token_ids(_drop_in_memory_data(cuts)),
             host_audio_lens=host_audio_lens,
+        )
+
+    def _get_prompted_token_ids(self, cuts: CutSet) -> tuple[Sequence, Sequence, Sequence]:
+        """Return the prompted transcript, prompt and answer token ids of every cut, in the order of ``cuts``.
+
+        The ids that the sampler attached to the cuts (tokenization and prompt formatting done before sampling) are
+        used when every cut has them; otherwise the prompt format is applied here.
+        """
+        attrs = ("input_ids", "context_ids", "answer_ids")
+        if all(hasattr(c, a) for c in cuts for a in attrs):
+            prompts_with_answers, prompts, answers = zip(*((c.input_ids, c.context_ids, c.answer_ids) for c in cuts))
+            return prompts_with_answers, prompts, answers
+        formatted = [apply_prompt_format_fn(cut, self.prompt) for cut in cuts]
+        return (
+            [ex["input_ids"] for ex in formatted],
+            [ex["context_ids"] for ex in formatted],
+            [ex["answer_ids"] for ex in formatted],
         )
 
     def _collate_tokens(self, tokens: list[Union[list[int], torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor]:

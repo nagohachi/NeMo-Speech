@@ -901,7 +901,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         if batch is None:
             return torch.tensor([0.0])
         if isinstance(batch, PackedPromptedAudioToTextMiniBatch):
-            return self._training_step_packed(batch)
+            return self._run_packed_training_step(batch)
 
         input_ids, labels = batch.get_decoder_inputs_outputs()
         input_ids_lens = batch.prompted_transcript_lens - 1
@@ -970,7 +970,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         )
         return {"loss": loss, "log": metric_dict}
 
-    def _training_step_packed(self, batch: PackedPromptedAudioToTextMiniBatch):
+    def _run_packed_training_step(self, batch: PackedPromptedAudioToTextMiniBatch):
         log_probs, decoder_context, encoded = self.forward_sequence_packed(batch)
         if self.cfg.get("use_loss_mask_for_prompt", False):
             # the target at position p of a sequence is token p + 1 of its prompted transcript,
@@ -1649,7 +1649,7 @@ def _check_aux_ctc_config(aux_ctc_config) -> None:
 def _check_packed_training_config(model_config: DictConfig, train_data_config: Optional[DictConfig]):
     """Refuse, before any data is read, the settings that the sequence-packed training step does not support.
 
-    ``train_ds.pack_sequences`` makes ``training_step`` run ``_training_step_packed`` on sequence-packed batches.
+    ``train_ds.pack_sequences`` makes ``training_step`` run ``_run_packed_training_step`` on sequence-packed batches.
     """
     if not train_data_config or not train_data_config.get("pack_sequences", False):
         return

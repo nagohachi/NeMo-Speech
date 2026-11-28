@@ -38,6 +38,7 @@ from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 from nemo.collections.asr.parts.packed_sequence import pack_encoder_output
 from nemo.collections.common.data import apply_prompt_format_fn
 from nemo.collections.common.data.lhotse import dataloader as lhotse_dataloader
+from nemo.collections.common.parts.adapter_modules import LinearAdapterConfig
 from nemo.collections.common.prompts.canary import CanaryPromptFormatter
 
 # the AED model fixture of the padded tests
@@ -200,13 +201,26 @@ def test_aux_ctc_packed_matches_padded_cuda_bf16(deterministic_rng, asr_model_ct
 
 
 @pytest.mark.unit
-def test_conv_asr_decoder_forward_packed_matches_forward(deterministic_rng):
+@pytest.mark.parametrize("temperature", [1.0, 2.0])
+def test_conv_asr_decoder_forward_packed_matches_forward(deterministic_rng, temperature):
+    """Check that the packed log probabilities are those of forward at the valid frames, also with a temperature."""
     decoder = ConvASRDecoder(feat_in=8, num_classes=5)
+    decoder.temperature = temperature
     lengths = torch.tensor([4, 2, 3])
     padded = torch.randn(3, 8, 4)
     expected = decoder(encoder_output=padded)  # (B, T, C)
     packed = decoder.forward_packed(pack_encoder_output(padded.transpose(1, 2), lengths))
     torch.testing.assert_close(packed.data, torch.cat([expected[i, :n] for i, n in enumerate(lengths.tolist())]))
+
+
+@pytest.mark.unit
+def test_conv_asr_decoder_forward_packed_refuses_adapters():
+    """Check that a decoder with an enabled adapter raises instead of skipping the adapter in the packed path."""
+    decoder = ConvASRDecoder(feat_in=8, num_classes=5)
+    decoder.add_adapter("adapter", LinearAdapterConfig(in_features=8, dim=4))
+    packed = pack_encoder_output(torch.randn(2, 3, 8), torch.tensor([3, 2]))
+    with pytest.raises(NotImplementedError, match="Adapters"):
+        decoder.forward_packed(packed)
 
 
 @pytest.mark.unit
