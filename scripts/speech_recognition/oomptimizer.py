@@ -123,11 +123,6 @@ class ProfilingBatchGenerator:
 
     def __call__(self, input_seq_length: int, output_seq_length: int):
         B = self._current
-        select_seq_length = {"input": input_seq_length, "output": output_seq_length}
-
-        def _get_seq_length(item: dict) -> int:
-            length = item["seq_length"]
-            return length if isinstance(length, int) else select_seq_length[length]
 
         batch = []
         names = []
@@ -141,16 +136,16 @@ class ProfilingBatchGenerator:
             elif not isinstance(nt, NeuralType):  # placeholder
                 tnsr = torch.tensor([])
             elif isinstance(nt.elements_type, AudioSignal):
-                seq_length = _get_seq_length(item)
+                seq_length = self._get_seq_length(item, input_seq_length, output_seq_length)
                 tnsr = torch.randn(B, seq_length, dtype=torch.float32, device=self.device)
             elif isinstance(nt.elements_type, LengthsType):
-                seq_length = _get_seq_length(item)
+                seq_length = self._get_seq_length(item, input_seq_length, output_seq_length)
                 tnsr = torch.ones(B, dtype=torch.long, device=self.device) * seq_length
             elif isinstance(nt.elements_type, LabelsType):
-                seq_length = _get_seq_length(item)
+                seq_length = self._get_seq_length(item, input_seq_length, output_seq_length)
                 tnsr = torch.randint(0, item["vocab_size"], size=(B, seq_length), device=self.device)
             elif isinstance(nt.elements_type, MaskType):
-                seq_length = _get_seq_length(item)
+                seq_length = self._get_seq_length(item, input_seq_length, output_seq_length)
                 tnsr = torch.ones(B, seq_length, device=self.device)
             else:
                 raise RuntimeError("Unexpected item in oomptimizer schema: {item}")
@@ -224,6 +219,14 @@ class ProfilingBatchGenerator:
                 self._current = round((self._max_ok + self._min_err) / 2)
 
         return False
+
+    @staticmethod
+    def _get_seq_length(item: dict, input_seq_length: int, output_seq_length: int) -> int:
+        """Return the length of a schema item: a fixed int, or the input or output length of the batch."""
+        length = item["seq_length"]
+        if isinstance(length, int):
+            return length
+        return {"input": input_seq_length, "output": output_seq_length}[length]
 
 
 class FloatList(click.Option):

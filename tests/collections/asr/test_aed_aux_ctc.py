@@ -117,13 +117,13 @@ def test_ctc_loss_of_a_transcript_too_long_for_its_frames_is_infinite_unless_opt
     """Check that zero_infinity is off by default, so such an utterance is not dropped from the CTC term silently,
     and that zero_infinity: true zeroes its loss."""
     targets = torch.tensor([[1, 2, 3]])  # three tokens
-    for aux_ctc, expected_finite in (
+    for aux_ctc_config, expected_finite in (
         ({"ctc_loss_weight": 0.3}, False),
         ({"ctc_loss_weight": 0.3, "zero_infinity": True}, True),
     ):
         cfg = asr_model.cfg.copy()
         with open_dict(cfg):
-            cfg.aux_ctc = aux_ctc
+            cfg.aux_ctc = aux_ctc_config
         model = EncDecMultiTaskModel(cfg=cfg)
         log_probs = torch.randn(1, 2, model.ctc_decoder.num_classes_with_blank).log_softmax(-1)  # two frames
         loss = model.ctc_loss(
@@ -158,7 +158,7 @@ def test_aux_ctc_refuses_keys_it_does_not_read(asr_model):
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "aux_ctc,message",
+    "aux_ctc_config,message",
     [
         ({"ctc_loss_weight": -0.1}, "between 0 and 1"),
         ({"ctc_loss_weight": 1.5}, "between 0 and 1"),
@@ -169,10 +169,10 @@ def test_aux_ctc_refuses_keys_it_does_not_read(asr_model):
         ({"ctc_loss_weight": 0.3, "zero_infinity": "yes"}, "zero_infinity must be a bool"),
     ],
 )
-def test_aux_ctc_rejects_values_it_cannot_apply(asr_model, aux_ctc, message):
+def test_aux_ctc_rejects_values_it_cannot_apply(asr_model, aux_ctc_config, message):
     cfg = asr_model.cfg.copy()
     with open_dict(cfg):
-        cfg.aux_ctc = aux_ctc
+        cfg.aux_ctc = aux_ctc_config
     with pytest.raises(ValueError, match=message):
         EncDecMultiTaskModel(cfg=cfg)
 
