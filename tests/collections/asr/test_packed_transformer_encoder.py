@@ -486,7 +486,7 @@ def test_flash_attention_varlen_prefers_flash_attn(monkeypatch):
     monkeypatch.setitem(sys.modules, "flash_attn", _make_fake_flash_attn_module())
     transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
     try:
-        assert transformer_encoder_utils_module._get_flash_attention_varlen() is _fake_flash_attn_varlen
+        assert transformer_encoder_utils_module._get_flash_attention_varlen() is _fail_on_flash_attn_varlen_call
     finally:
         transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
 
@@ -503,7 +503,7 @@ def test_flash_attention_varlen_device_lookup_compiles_into_one_graph(monkeypatc
     monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", flash_attn_installed, raising=False)
     monkeypatch.setitem(sys.modules, "flash_attn", _make_fake_flash_attn_module() if flash_attn_installed else None)
     expected_provider = (
-        _fake_flash_attn_varlen
+        _fail_on_flash_attn_varlen_call
         if flash_attn_installed
         else transformer_encoder_utils_module._run_torch_flash_attention_varlen
     )
@@ -749,11 +749,11 @@ def _fail_on_import():
 def _make_fake_flash_attn_module():
     """Return a module that stands in for an installed flash-attn."""
     module = types.ModuleType("flash_attn")
-    module.flash_attn_varlen_func = _fake_flash_attn_varlen
+    module.flash_attn_varlen_func = _fail_on_flash_attn_varlen_call
     return module
 
 
-def _fake_flash_attn_varlen(*args, **kwargs):
+def _fail_on_flash_attn_varlen_call(*args, **kwargs):
     """Stand in for flash_attn.flash_attn_varlen_func, which the lookup returns without calling."""
     raise AssertionError("not called")
 
