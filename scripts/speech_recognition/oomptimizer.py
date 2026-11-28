@@ -123,7 +123,6 @@ class ProfilingBatchGenerator:
 
     def __call__(self, input_seq_length: int, output_seq_length: int):
         B = self._current
-
         batch = []
         names = []
         for item in self.schema["inputs"]:

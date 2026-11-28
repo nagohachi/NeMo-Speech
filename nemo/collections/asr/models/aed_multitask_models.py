@@ -1541,9 +1541,12 @@ def _check_aux_ctc_config(aux_ctc_config) -> None:
     if (
         isinstance(ctc_loss_weight, bool)
         or not isinstance(ctc_loss_weight, (int, float))
-        or not 0 <= ctc_loss_weight <= 1
+        or not 0 <= ctc_loss_weight < 1
     ):
-        raise ValueError(f"aux_ctc.ctc_loss_weight must be a number between 0 and 1, got {ctc_loss_weight!r}.")
+        raise ValueError(
+            "aux_ctc.ctc_loss_weight must be a number from 0 up to but not including 1 (at 1 the attention decoder "
+            f"gets no loss and does not train), got {ctc_loss_weight!r}."
+        )
     if ctc_loss_weight == 0 and (unused := set(aux_ctc_config) & {"ctc_reduction", "zero_infinity"}):
         raise ValueError(f"aux_ctc sets {sorted(unused)}, which apply only with ctc_loss_weight > 0.")
     reduction = aux_ctc_config.get("ctc_reduction", "mean_volume")

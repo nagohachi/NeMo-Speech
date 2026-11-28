@@ -57,7 +57,7 @@ Auxiliary CTC loss of EncDecMultiTaskModel
 ``(1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss``.
 The CTC targets are the transcript tokens without the prompt; the Canary prompt formats already leave the end-of-text token out of them.
 
-* ``ctc_loss_weight`` (default ``0.0``, no CTC loss): a number between 0 and 1.
+* ``ctc_loss_weight`` (default ``0.0``, no CTC loss): a number from 0 up to but not including 1; at 1 the attention decoder would get no loss and not train.
 * ``ctc_reduction`` (default ``mean_volume``): ``mean_volume`` divides the CTC loss by the number of target tokens, a per-token loss like the attention cross-entropy; ``mean_batch``, ``mean`` and ``sum`` are the reductions of ``CTCLoss``.
 * ``zero_infinity`` (default ``false``): a transcript with more tokens than its utterance has encoder frames makes the CTC loss infinite; ``true`` sets the loss of such an utterance and its gradients to zero instead, so that it trains on the attention loss alone.
 

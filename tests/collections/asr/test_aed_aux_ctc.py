@@ -21,6 +21,7 @@ import pytest
 import torch
 from lhotse import CutSet, SupervisionSegment
 from lhotse.testing.dummies import dummy_cut
+from lhotse.utils import fastcopy
 from omegaconf import open_dict
 
 from nemo.collections.asr.data.audio_to_text_lhotse_prompted import PromptedAudioToTextLhotseDataset
@@ -84,7 +85,7 @@ def test_validation_loss_is_the_attention_loss_without_ctc(asr_model_ctc, cuts, 
 
 
 @pytest.mark.unit
-def test_padded_training_step_mixes_attention_and_ctc_losses(asr_model_ctc, cuts):
+def test_padded_training_step_mixes_attention_and_ctc_losses(asr_model_ctc, cuts, monkeypatch):
     """Check that the padded step trains on 0.7 * attention loss + 0.3 * CTC loss, the CTC loss computed here
     from the encoder output, and that the CTC head gets gradients."""
     asr_model_ctc.eval()
@@ -106,30 +107,38 @@ def test_padded_training_step_mixes_attention_and_ctc_losses(asr_model_ctc, cuts
             input_lengths=encoded_len,
             target_lengths=batch.transcript_lens,  # the answers end without the end-of-text token
         )
-        asr_model_ctc.ctc_loss_weight = 0.0
+        monkeypatch.setattr(asr_model_ctc, "ctc_loss_weight", 0.0)
         attention_loss = asr_model_ctc.training_step(batch, batch_nb=0)["loss"]
     assert torch.isfinite(ctc_loss) and ctc_loss > 0
     torch.testing.assert_close(loss.detach(), 0.7 * attention_loss + 0.3 * ctc_loss)
 
 
 @pytest.mark.unit
-def test_ctc_loss_of_a_transcript_too_long_for_its_frames_is_infinite_unless_opted_out(asr_model):
-    """Check that zero_infinity is off by default, so such an utterance is not dropped from the CTC term silently,
-    and that zero_infinity: true zeroes its loss."""
-    targets = torch.tensor([[1, 2, 3]])  # three tokens
-    for aux_ctc_config, expected_finite in (
-        ({"ctc_loss_weight": 0.3}, False),
-        ({"ctc_loss_weight": 0.3, "zero_infinity": True}, True),
-    ):
-        cfg = asr_model.cfg.copy()
-        with open_dict(cfg):
-            cfg.aux_ctc = aux_ctc_config
-        model = EncDecMultiTaskModel(cfg=cfg)
-        log_probs = torch.randn(1, 2, model.ctc_decoder.num_classes_with_blank).log_softmax(-1)  # two frames
-        loss = model.ctc_loss(
-            log_probs=log_probs, targets=targets, input_lengths=torch.tensor([2]), target_lengths=torch.tensor([3])
+@pytest.mark.parametrize("zero_infinity", [False, True])
+def test_training_loss_with_a_transcript_too_long_for_its_frames(asr_model, cuts, zero_infinity):
+    """Check, through training_step, that a transcript with more tokens than its utterance has encoder frames makes
+    the loss infinite by default, so the utterance is not dropped from the CTC term silently, and that
+    aux_ctc.zero_infinity: true zeroes its CTC loss so that the training loss stays finite."""
+    aux_ctc_config = {"ctc_loss_weight": 0.3} | ({"zero_infinity": True} if zero_infinity else {})
+    cfg = asr_model.cfg.copy()
+    with open_dict(cfg):
+        cfg.aux_ctc = aux_ctc_config
+    model = EncDecMultiTaskModel(cfg=cfg).eval()
+    model.configure_optimizers()
+    model.metric.eval = lambda **kwargs: {}
+    short_cut = cuts[0].truncate(duration=0.1)  # 0.1 s of audio, a few encoder frames
+    too_long = fastcopy(short_cut.supervisions[0], duration=0.1, text="a long transcript for so short a cut")
+    batch = _make_padded_dataset(model)[CutSet([fastcopy(short_cut, supervisions=[too_long]), cuts[1]])]
+    with torch.no_grad():
+        _, encoded_len, *_ = model._forward(
+            input_signal=batch.audio,
+            input_signal_length=batch.audio_lens,
+            transcript=batch.get_decoder_inputs_outputs()[0],
+            transcript_length=batch.prompted_transcript_lens - 1,
         )
-        assert bool(torch.isfinite(loss)) == expected_finite
+        loss = model.training_step(batch, batch_nb=0)["loss"]
+    assert batch.transcript_lens[0] > encoded_len[0]  # more tokens than frames
+    assert bool(torch.isfinite(loss)) == zero_infinity
 
 
 @pytest.mark.unit
@@ -160,9 +169,10 @@ def test_aux_ctc_refuses_keys_it_does_not_read(asr_model):
 @pytest.mark.parametrize(
     "aux_ctc_config,message",
     [
-        ({"ctc_loss_weight": -0.1}, "between 0 and 1"),
-        ({"ctc_loss_weight": 1.5}, "between 0 and 1"),
-        ({"ctc_loss_weight": None}, "between 0 and 1"),
+        ({"ctc_loss_weight": -0.1}, "up to but not including 1"),
+        ({"ctc_loss_weight": 1.5}, "up to but not including 1"),
+        ({"ctc_loss_weight": 1.0}, "up to but not including 1"),
+        ({"ctc_loss_weight": None}, "up to but not including 1"),
         ({"ctc_reduction": "mean_batch"}, "apply only with ctc_loss_weight > 0"),
         ({"ctc_loss_weight": 0.0, "zero_infinity": True}, "apply only with ctc_loss_weight > 0"),
         ({"ctc_loss_weight": 0.3, "ctc_reduction": "none"}, "ctc_reduction must be one of"),
