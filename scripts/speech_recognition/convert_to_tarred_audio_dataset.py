@@ -661,6 +661,11 @@ class ASRTarredDatasetBuilder:
                 audio_filepath = os.path.join(manifest_folder, entry["audio_filepath"])
                 if not os.path.exists(audio_filepath):
                     raise FileNotFoundError(f"Could not find {entry['audio_filepath']}!")
+            # only_manifests names members after the path in the manifest, but reads the format of cropped audio
+            # from the file, which a relative path names from the manifest folder
+            source_filepath = audio_filepath
+            if only_manifests and manifest_folder and not os.path.exists(audio_filepath):
+                source_filepath = os.path.join(manifest_folder, audio_filepath)
 
             base, ext = os.path.splitext(audio_filepath)
             base = base.replace('/', '_')
@@ -697,7 +702,7 @@ class ASRTarredDatasetBuilder:
 
                 to_write = base + "_" + entry_offset + "_" + entry_duration + ext
                 if only_manifests:
-                    to_write = self._get_tar_member_name(audio_filepath, to_write, cropped=True)
+                    to_write = self._get_tar_member_name(source_filepath, to_write, cropped=True)
                 else:
                     to_write = self._write_to_tar(
                         tar, audio_filepath, to_write, duration=entry['duration'], offset=entry['offset']

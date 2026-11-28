@@ -45,7 +45,7 @@ def _write_audio(path: Path, seconds: float) -> str:
     return str(path)
 
 
-def _squashed_base(audio_filepath: str) -> str:
+def _get_squashed_base(audio_filepath: str) -> str:
     """Return the member name stem that the converter makes from a source path, without the extension."""
     return str(Path(audio_filepath).with_suffix("")).replace("/", "_").replace(".", "_")
 
@@ -103,7 +103,7 @@ def test_manifest_names_tar_members(tmp_path, converter, source_ext, force_codec
         [dict(e) for e in entries], str(tmp_path / "unused"), shard_id=0, only_manifests=True
     )
 
-    talk_base, other_base = _squashed_base(talk_filepath), _squashed_base(other_filepath)
+    talk_base, other_base = _get_squashed_base(talk_filepath), _get_squashed_base(other_filepath)
     if slice_with_offset:
         expected_names = [f"{talk_base}_0_5_1_0.{member_ext}", f"{talk_base}_1_75_1_25.{member_ext}"]
         expected_members = set(expected_names)
@@ -134,8 +134,23 @@ def test_only_manifests_without_source_audio_names_forced_codec_members(tmp_path
     entries = _make_entries(missing_filepath, missing_filepath, slice_with_offset=True)
     builder = _make_builder(converter, force_codec="flac", slice_with_offset=True)
     manifest_only_entries = builder._create_shard(entries, str(tmp_path), shard_id=0, only_manifests=True)
-    missing_base = _squashed_base(missing_filepath)
+    missing_base = _get_squashed_base(missing_filepath)
     assert [e["audio_filepath"] for e in manifest_only_entries] == [
         f"{missing_base}_0_5_1_0.flac",
         f"{missing_base}_1_75_1_25.flac",
     ]
+
+
+@pytest.mark.unit
+def test_only_manifests_reads_the_format_of_a_relative_path_from_the_manifest_folder(tmp_path, converter, monkeypatch):
+    """Check that only_manifests finds the source of a path relative to the manifest folder to name its member."""
+    manifest_folder = tmp_path / "data"
+    manifest_folder.mkdir()
+    _write_audio(manifest_folder / "talk.OGG", 3.0)
+    monkeypatch.chdir(tmp_path)  # the relative path does not exist from the working directory
+    entries = _make_entries("talk.OGG", "talk.OGG", slice_with_offset=True)
+    builder = _make_builder(converter, force_codec=None, slice_with_offset=True)
+    manifest_only_entries = builder._create_shard(
+        entries, str(tmp_path), shard_id=0, manifest_folder=str(manifest_folder), only_manifests=True
+    )
+    assert [e["audio_filepath"] for e in manifest_only_entries] == ["talk_0_5_1_0.ogg", "talk_1_75_1_25.ogg"]
