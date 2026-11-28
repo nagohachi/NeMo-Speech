@@ -536,8 +536,6 @@ def test_packed_training_loader_through_model_setup(tmp_path, monkeypatch, asr_m
 def test_int16_audio_through_model_setup(tmp_path, asr_model, cuts):
     """Check that train_ds.int16_audio reaches the dataset of the model setup, which reads the audio files as int16."""
     path = _save_cuts(cuts, tmp_path)
-    with open_dict(asr_model.cfg):
-        asr_model.cfg.train_batch_metrics = False
     config = _make_loader_config(path, pin_memory=False)
     config.int16_audio = True
 
