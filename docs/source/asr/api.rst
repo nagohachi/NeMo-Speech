@@ -50,6 +50,23 @@ Model Classes
     :members: setup_training_data, setup_optimization, setup_validation_data, setup_test_data, register_artifact
 
 
+Auxiliary CTC loss of EncDecMultiTaskModel
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``model.aux_ctc`` adds a ``ConvASRDecoder`` on the encoder output of ``EncDecMultiTaskModel`` and trains with
+``(1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss``.
+The CTC targets are the transcript tokens without the prompt; the Canary prompt formats already leave the end-of-text token out of them.
+
+* ``ctc_loss_weight`` (default ``0.0``, no CTC loss): a number from 0 up to but not including 1; at 1 the attention decoder would get no loss and not train.
+* ``ctc_reduction`` (default ``mean_volume``): ``mean_volume`` divides the CTC loss by the number of target tokens, a per-token loss like the attention cross-entropy; ``mean_batch``, ``mean`` and ``sum`` are the reductions of ``CTCLoss``.
+* ``zero_infinity`` (default ``false``): a transcript with more tokens than its utterance has encoder frames makes the CTC loss infinite; ``true`` sets the loss of such an utterance and its gradients to zero instead, so that it trains on the attention loss alone.
+
+``ctc_reduction`` and ``zero_infinity`` require a positive ``ctc_loss_weight``.
+
+The CTC head serves only as this auxiliary training loss: validation and inference (``transcribe``) use the attention decoder alone,
+so ``val_loss`` is the attention loss, comparable with the logged ``train_attn_loss`` rather than with the mixed ``train_loss``.
+
+
 .. _asr-api-modules:
 
 Modules

@@ -37,6 +37,13 @@ model:
   label_smoothing: 0.0
   use_loss_mask_for_prompt: false
   log_prediction: true # enables logging sample predictions in the output during training
+  # Auxiliary CTC loss on the encoder output (hybrid CTC/attention training):
+  # loss = (1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss.
+  # ctc_reduction mean_volume (the default) divides the CTC loss by the number of target tokens, like the attention loss.
+  # aux_ctc:
+  #   ctc_loss_weight: 0.3
+  #   ctc_reduction: mean_volume
+  #   zero_infinity: false # true: train utterances whose transcript is too long for CTC on the attention loss alone
 
   # Important ! Set the prompt format to the class you need
   prompt_format: ???   # Options supported: ["canary", "canary2"]

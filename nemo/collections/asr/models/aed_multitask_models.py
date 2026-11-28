@@ -30,8 +30,10 @@ from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
     PromptedAudioToTextLhotseDataset,
     PromptedAudioToTextMiniBatch,
 )
+from nemo.collections.asr.losses.ctc import CTCLoss
 from nemo.collections.asr.metrics import MultiTaskMetric
 from nemo.collections.asr.models.asr_model import ASRModel, ExportableEncDecModel
+from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 from nemo.collections.asr.parts.mixins import ASRBPEMixin, ASRModuleMixin, ASRTranscriptionMixin
 from nemo.collections.asr.parts.mixins.transcription import (
     GenericTranscriptionType,
@@ -226,6 +228,15 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             self.cfg.loss.pad_id = self.tokenizer.pad_id
 
         self.loss = EncDecMultiTaskModel.from_config_dict(self.cfg.loss)
+
+        # Optional auxiliary CTC loss on the encoder output (hybrid CTC/attention training):
+        # the training loss becomes (1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss.
+        # The CTC targets are the transcript tokens without the prompt, which the prompt formats end without EOS.
+        aux_ctc_config = self.cfg.get("aux_ctc") or {}
+        _check_aux_ctc_config(aux_ctc_config)
+        self.ctc_loss_weight = float(aux_ctc_config.get("ctc_loss_weight", 0.0))
+        if self.ctc_loss_weight > 0:
+            self._setup_aux_ctc(vocab_size)
 
         if hasattr(self.cfg, 'spec_augment') and self.cfg.spec_augment is not None:
             self.spec_augmentation = EncDecMultiTaskModel.from_config_dict(self.cfg.spec_augment)
@@ -427,11 +438,30 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         del self.loss
         self.loss = EncDecMultiTaskModel.from_config_dict(self.cfg.loss)
 
+        if self.ctc_loss_weight > 0:
+            # the CTC head and its blank follow the new vocabulary
+            self._setup_aux_ctc(vocab_size)
+
         # Update config
         with open_dict(self.cfg):
             self.cfg.prompt_format = prompt_format
 
         logging.info(f"Changed decoder to output to {vocabulary} vocabulary.")
+
+    def _setup_aux_ctc(self, vocab_size: int):
+        """Build the CTC head and loss of ``aux_ctc`` for ``vocab_size`` tokens (the blank is one more class).
+
+        ``ctc_reduction`` defaults to ``mean_volume``, the summed CTC losses divided by the number of target tokens,
+        a per-token loss like the attention cross-entropy, so that ``ctc_loss_weight`` weighs two comparable terms.
+        ``zero_infinity`` defaults to False: a transcript too long for its encoder frames makes the loss infinite
+        instead of leaving the CTC term without a word.
+        """
+        self.ctc_decoder = ConvASRDecoder(feat_in=self.cfg.model_defaults.asr_enc_hidden, num_classes=vocab_size)
+        self.ctc_loss = CTCLoss(
+            num_classes=vocab_size,
+            zero_infinity=self.cfg.aux_ctc.get("zero_infinity", False),
+            reduction=self.cfg.aux_ctc.get("ctc_reduction", "mean_volume"),
+        )
 
     def change_prompt(
         self, prompt_format: Optional[str] = None, prompt_defaults: Optional[List[Dict[str, Any]]] = None
@@ -761,6 +791,25 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             2) The lengths of the acoustic sequence after propagation through the encoder, of shape [B].
             3) The greedy token predictions of the model of shape [B, T] (via argmax)
         """
+        return self._forward(
+            input_signal=input_signal,
+            input_signal_length=input_signal_length,
+            processed_signal=processed_signal,
+            processed_signal_length=processed_signal_length,
+            transcript=transcript,
+            transcript_length=transcript_length,
+        )[:4]
+
+    def _forward(
+        self,
+        input_signal=None,
+        input_signal_length=None,
+        processed_signal=None,
+        processed_signal_length=None,
+        transcript=None,
+        transcript_length=None,
+    ):
+        """Run ``forward`` and also return the encoder output ``(B, D, T)`` as the fifth item."""
         has_input_signal = input_signal is not None and input_signal_length is not None
         has_processed_signal = processed_signal is not None and processed_signal_length is not None
         if (has_input_signal ^ has_processed_signal) == False:
@@ -793,7 +842,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             )
             transf_log_probs = self.log_softmax(hidden_states=dec_states)
 
-        return transf_log_probs, encoded_len, enc_states, enc_mask
+        return transf_log_probs, encoded_len, enc_states, enc_mask, encoded
 
     # PTL-specific methods
     def training_step(self, batch: PromptedAudioToTextMiniBatch, batch_nb):
@@ -808,7 +857,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         tot_frames = torch.as_tensor(batch.audio.numel(), device=num_frames.device, dtype=torch.float)
         tot_tokens = torch.as_tensor(batch.prompted_transcript.numel(), device=num_frames.device, dtype=torch.float)
 
-        transf_log_probs, encoded_len, enc_states, enc_mask = self.forward(
+        transf_log_probs, encoded_len, enc_states, enc_mask, encoded = self._forward(
             input_signal=batch.audio,
             input_signal_length=batch.audio_lens,
             transcript=input_ids,
@@ -824,6 +873,16 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
         else:
             loss_mask = None
         transf_loss = self.loss(log_probs=transf_log_probs, labels=labels, output_mask=loss_mask)
+        loss, ctc_metrics = transf_loss, {}
+        if self.ctc_loss_weight > 0:
+            ctc_loss = self.ctc_loss(
+                log_probs=self.ctc_decoder(encoder_output=encoded),
+                targets=batch.transcript,
+                input_lengths=encoded_len,
+                target_lengths=batch.transcript_lens,
+            )
+            loss = (1 - self.ctc_loss_weight) * transf_loss + self.ctc_loss_weight * ctc_loss
+            ctc_metrics = {'train_ctc_loss': ctc_loss, 'train_attn_loss': transf_loss}
 
         # Train step evaluation. From other asr models.
         if hasattr(self, '_trainer') and self._trainer is not None:
@@ -842,9 +901,10 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             else {}
         )
 
+        metric_dict.update(ctc_metrics)
         metric_dict.update(
             {
-                'train_loss': transf_loss,
+                'train_loss': loss,
                 'learning_rate': torch.as_tensor(self._optimizer.param_groups[0]['lr']),
                 'batch_size': torch.as_tensor(batch.audio.shape[0]),
                 'num_frames': num_frames,
@@ -853,7 +913,7 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 'output_to_padding_ratio': num_tokens / tot_tokens,
             }
         )
-        return {"loss": transf_loss, "log": metric_dict}
+        return {"loss": loss, "log": metric_dict}
 
     def validation_pass(self, batch: PromptedAudioToTextMiniBatch, batch_idx, dataloader_idx=0, eval_mode="val"):
         input_ids, labels = batch.get_decoder_inputs_outputs()
@@ -1331,10 +1391,17 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                     "type": NeuralType(("B",), LengthsType()),
                     "seq_length": "output",
                 },
-                {"name": "transcript", "type": "dummy"},
-                {"name": "transcript_lens", "type": "dummy"},
+                # the CTC targets of aux_ctc
+                {
+                    "name": "transcript",
+                    "type": NeuralType(("B", "T"), LabelsType()),
+                    "seq_length": "output",
+                    "vocab_size": self.tokenizer.vocab_size,
+                },
+                {"name": "transcript_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": "output"},
                 {"name": "prompt", "type": "dummy"},
-                {"name": "prompt_lens", "type": "dummy"},
+                # a one-token prompt, which training_step reads with use_loss_mask_for_prompt
+                {"name": "prompt_lens", "type": NeuralType(("B",), LengthsType()), "seq_length": 1},
             ],
         }
 
@@ -1461,3 +1528,31 @@ def parse_multitask_prompt(prompt: dict | None) -> list[dict]:
     # )
     role = prompt.pop("role", "user")
     return [dict(role=role, slots=prompt)]
+
+
+def _check_aux_ctc_config(aux_ctc_config) -> None:
+    """Raise ``ValueError`` for an ``aux_ctc`` config that ``EncDecMultiTaskModel`` cannot apply as written."""
+    if unsupported := set(aux_ctc_config) - {"ctc_loss_weight", "ctc_reduction", "zero_infinity"}:
+        raise ValueError(
+            f"aux_ctc has keys that EncDecMultiTaskModel does not read: {sorted(unsupported)}. Its CTC head is a "
+            "ConvASRDecoder on the encoder output; set only ctc_loss_weight, ctc_reduction and zero_infinity."
+        )
+    ctc_loss_weight = aux_ctc_config.get("ctc_loss_weight", 0.0)
+    if (
+        isinstance(ctc_loss_weight, bool)
+        or not isinstance(ctc_loss_weight, (int, float))
+        or not 0 <= ctc_loss_weight < 1
+    ):
+        raise ValueError(
+            "aux_ctc.ctc_loss_weight must be a number from 0 up to but not including 1 (at 1 the attention decoder "
+            f"gets no loss and does not train), got {ctc_loss_weight!r}."
+        )
+    if ctc_loss_weight == 0 and (unused := set(aux_ctc_config) & {"ctc_reduction", "zero_infinity"}):
+        raise ValueError(f"aux_ctc sets {sorted(unused)}, which apply only with ctc_loss_weight > 0.")
+    reduction = aux_ctc_config.get("ctc_reduction", "mean_volume")
+    if reduction not in ("mean_volume", "mean_batch", "mean", "sum"):
+        raise ValueError(
+            f"aux_ctc.ctc_reduction must be one of mean_volume, mean_batch, mean or sum, got {reduction!r}."
+        )
+    if not isinstance(aux_ctc_config.get("zero_infinity", False), bool):
+        raise ValueError(f"aux_ctc.zero_infinity must be a bool, got {aux_ctc_config.get('zero_infinity')!r}.")
