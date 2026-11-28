@@ -419,6 +419,24 @@ def test_packed_training_refuses_unsupported_settings(asr_model, setting, match)
 
 
 @pytest.mark.unit
+def test_packed_training_refuses_an_encoder_without_a_packed_forward(asr_model, monkeypatch):
+    """Check that setup refuses an encoder without forward_sequence_packed instead of failing at the first step."""
+    monkeypatch.setattr(asr_model, "encoder", torch.nn.Linear(2, 2))
+    with pytest.raises(ValueError, match="forward_sequence_packed"):
+        asr_model.setup_training_data(OmegaConf.create({"use_lhotse": True, "pack_sequences": True}))
+
+
+@pytest.mark.unit
+def test_packed_training_refuses_adapters_on_the_ctc_head(asr_model_ctc):
+    """Check that setup refuses a CTC head with adapters, which the packed CTC forward does not apply."""
+    asr_model_ctc.ctc_decoder.add_adapter(
+        "adapter", LinearAdapterConfig(in_features=asr_model_ctc.ctc_decoder._feat_in, dim=4)
+    )
+    with pytest.raises(ValueError, match="adapters"):
+        asr_model_ctc.setup_training_data(OmegaConf.create({"use_lhotse": True, "pack_sequences": True}))
+
+
+@pytest.mark.unit
 def test_packed_training_loader_through_model_setup(tmp_path, monkeypatch, asr_model, cuts):
     """Check that the model setup's training loader (a worker process, collation of 3 cuts) yields the packed batch."""
     path = _save_cuts(cuts, tmp_path)

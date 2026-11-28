@@ -686,7 +686,9 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
 
     def setup_training_data(self, train_data_config: Optional[DictConfig]):
 
-        _check_packed_training_config(self.cfg, train_data_config)
+        _check_packed_training_config(
+            self.cfg, train_data_config, encoder=self.encoder, ctc_decoder=getattr(self, "ctc_decoder", None)
+        )
         # create audio-only data loader
         self._update_dataset_config(dataset_name='train', config=train_data_config)
         self._train_dl = self._setup_dataloader_from_config(config=train_data_config)
@@ -1645,13 +1647,30 @@ def _check_aux_ctc_config(aux_ctc_config) -> None:
         raise ValueError(f"aux_ctc.zero_infinity must be a bool, got {aux_ctc_config.get('zero_infinity')!r}.")
 
 
-def _check_packed_training_config(model_config: DictConfig, train_data_config: Optional[DictConfig]):
+def _check_packed_training_config(
+    model_config: DictConfig,
+    train_data_config: Optional[DictConfig],
+    *,
+    encoder: torch.nn.Module,
+    ctc_decoder: Optional[torch.nn.Module],
+):
     """Refuse, before any data is read, the settings that the sequence-packed training step does not support.
 
     ``train_ds.pack_sequences`` makes ``training_step`` run ``_run_packed_training_step`` on sequence-packed batches.
+    ``ctc_decoder`` is the head of the auxiliary CTC loss, or None without it.
     """
     if not train_data_config or not train_data_config.get("pack_sequences", False):
         return
+    if not hasattr(encoder, "forward_sequence_packed"):
+        raise ValueError(
+            f"train_ds.pack_sequences: the encoder {type(encoder).__name__} has no forward_sequence_packed; "
+            "the packed training step needs an encoder with a sequence-packed forward, such as ConformerEncoder."
+        )
+    if ctc_decoder is not None and ctc_decoder.is_adapter_available():
+        raise ValueError(
+            "train_ds.pack_sequences: the CTC head of aux_ctc has adapters, which its sequence-packed forward does "
+            "not apply. Train with padded batches or without the adapters."
+        )
     transf_encoder_config = model_config.get("transf_encoder")
     if transf_encoder_config is not None and transf_encoder_config.get("num_layers", 0) > 0:
         raise ValueError("train_ds.pack_sequences: the Transformer encoder (transf_encoder) has no packed form.")
