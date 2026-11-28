@@ -40,7 +40,7 @@ def test_int16_rows_scale_to_the_float_rows_of_whole_and_partial_cuts(tmp_path, 
     cuts = CutSet([whole_cut, whole_cut.truncate(offset=0.37, duration=0.5), whole_cut.truncate(offset=1.0)])
 
     float_rows, _ = read_unpadded_audio_rows(cuts, AudioSamples())
-    int16_rows, int16_cuts = read_unpadded_audio_rows(cuts, AudioSamples(), dtype=torch.int16)
+    int16_rows, int16_cuts = read_unpadded_audio_rows(cuts, AudioSamples(), int16=True)
 
     assert [cut.id for cut in int16_cuts] == [cut.id for cut in cuts]
     assert [row.numel() for row in int16_rows] == [24000, 8000, 8000]
@@ -56,7 +56,7 @@ def test_int16_rows_pad_a_slightly_short_file_as_lhotse_does(tmp_path):
     cuts = CutSet([_make_recording(path, num_samples=16000).to_cut()])
 
     float_rows, _ = read_unpadded_audio_rows(cuts, AudioSamples())
-    int16_rows, _ = read_unpadded_audio_rows(cuts, AudioSamples(), dtype=torch.int16)
+    int16_rows, _ = read_unpadded_audio_rows(cuts, AudioSamples(), int16=True)
 
     assert int16_rows[0].numel() == float_rows[0].numel() == 16000
     assert torch.equal(int16_rows[0].to(torch.float32) / INT16_AUDIO_SCALE, float_rows[0])
@@ -69,7 +69,7 @@ def test_int16_rows_raise_for_a_file_shorter_than_the_cut(tmp_path):
     path = _write_audio(tmp_path / "short.wav", num_samples=16000)
     cut = _make_recording(path, num_samples=64000).to_cut().truncate(offset=0.5, duration=2.0)
     with pytest.raises(ValueError, match="requests 2.0 s"):
-        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(), dtype=torch.int16)
+        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(), int16=True)
 
 
 @pytest.mark.unit
@@ -79,7 +79,7 @@ def test_int16_rows_refuse_audio_that_is_not_16_bit_pcm(tmp_path, subtype, fault
     """Check that the reader raises for samples that int16 would quantize, also when it drops unreadable cuts."""
     cuts = CutSet([Recording.from_file(_write_audio(tmp_path / "talk.wav", 8000, subtype=subtype)).to_cut()])
     with pytest.raises(ValueError, match=f"its audio is {subtype}, not 16-bit PCM"):
-        read_unpadded_audio_rows(cuts, AudioSamples(fault_tolerant=fault_tolerant), dtype=torch.int16)
+        read_unpadded_audio_rows(cuts, AudioSamples(fault_tolerant=fault_tolerant), int16=True)
 
 
 @pytest.mark.unit
@@ -90,7 +90,7 @@ def test_int16_rows_refuse_a_file_that_differs_from_its_recording(tmp_path, faul
     path = _write_audio(tmp_path / "talk.wav", num_samples=8000)
     cut = _make_recording(path, num_samples=4000, sampling_rate=8000).to_cut()
     with pytest.raises(ValueError, match=r"1 channel\(s\) at 16000 Hz, the recording declares 1 channel at 8000 Hz"):
-        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(fault_tolerant=fault_tolerant), dtype=torch.int16)
+        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(fault_tolerant=fault_tolerant), int16=True)
 
 
 @pytest.mark.unit
@@ -102,7 +102,7 @@ def test_int16_rows_refuse_a_stereo_file_that_its_recording_declares_mono(tmp_pa
     soundfile.write(path, np.zeros((8000, 2), dtype=np.int16), SAMPLING_RATE, subtype="PCM_16")
     cut = _make_recording(path, num_samples=8000).to_cut()
     with pytest.raises(ValueError, match=r"2 channel\(s\) at 16000 Hz, the recording declares 1 channel"):
-        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(fault_tolerant=fault_tolerant), dtype=torch.int16)
+        read_unpadded_audio_rows(CutSet([cut]), AudioSamples(fault_tolerant=fault_tolerant), int16=True)
 
 
 @pytest.mark.unit
@@ -126,15 +126,7 @@ def test_int16_rows_refuse_cuts_they_cannot_read_exactly(tmp_path, fault_toleran
         (mono_cut.pad(duration=1.0), "a MixedCut without a recording of its own"),
     ):
         with pytest.raises(ValueError, match=message):
-            read_unpadded_audio_rows(CutSet([cut]), load_audio, dtype=torch.int16)
-
-
-@pytest.mark.unit
-def test_rows_refuse_a_dtype_other_than_float32_and_int16(tmp_path):
-    """Check that the reader raises for a sample dtype it has no reading for."""
-    cuts = CutSet([Recording.from_file(_write_audio(tmp_path / "talk.wav", num_samples=8000)).to_cut()])
-    with pytest.raises(ValueError, match="float32 or int16"):
-        read_unpadded_audio_rows(cuts, AudioSamples(), dtype=torch.float16)
+            read_unpadded_audio_rows(CutSet([cut]), load_audio, int16=True)
 
 
 @pytest.mark.unit
@@ -149,7 +141,7 @@ def test_int16_rows_from_worker_threads_keep_the_order_of_the_cuts_that_load(tmp
     load_audio = AudioSamples(num_workers=2, fault_tolerant=True)
 
     float_rows, _ = read_unpadded_audio_rows(cuts, load_audio)
-    int16_rows, int16_cuts = read_unpadded_audio_rows(cuts, load_audio, dtype=torch.int16)
+    int16_rows, int16_cuts = read_unpadded_audio_rows(cuts, load_audio, int16=True)
 
     assert [cut.id for cut in int16_cuts] == [whole_cut.id, cuts[2].id]
     assert [row.numel() for row in int16_rows] == [24000, 8000]
@@ -162,7 +154,7 @@ def test_int16_rows_from_worker_threads_raise_for_audio_that_is_not_16_bit_pcm(t
     """Check that an unsupported file raises from a worker thread too, also with fault-tolerant loading."""
     cuts = CutSet([Recording.from_file(_write_audio(tmp_path / "talk.wav", 8000, subtype="PCM_24")).to_cut()])
     with pytest.raises(ValueError, match="not 16-bit PCM"):
-        read_unpadded_audio_rows(cuts, AudioSamples(num_workers=2, fault_tolerant=True), dtype=torch.int16)
+        read_unpadded_audio_rows(cuts, AudioSamples(num_workers=2, fault_tolerant=True), int16=True)
 
 
 def _write_audio(path, num_samples, subtype="PCM_16"):

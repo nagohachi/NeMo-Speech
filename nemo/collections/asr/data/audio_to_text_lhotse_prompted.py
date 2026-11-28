@@ -201,8 +201,7 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
 
     def _get_packed_batch(self, cuts: CutSet) -> PackedPromptedAudioToTextMiniBatch:
         num_cuts = len(cuts)
-        dtype = torch.int16 if self.int16_audio else torch.float32
-        rows, cuts = read_unpadded_audio_rows(cuts, self.load_audio, dtype=dtype)
+        rows, cuts = read_unpadded_audio_rows(cuts, self.load_audio, int16=self.int16_audio)
         if not rows:
             raise ValueError(
                 f"The audio of none of the {num_cuts} cuts of the batch could be loaded: "

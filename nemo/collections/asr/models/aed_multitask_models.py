@@ -1663,7 +1663,14 @@ def _check_packed_training_config(
     ``train_ds.pack_sequences`` makes ``training_step`` run ``_run_packed_training_step`` on sequence-packed batches.
     ``ctc_decoder`` is the head of the auxiliary CTC loss, or None without it.
     """
-    if not train_data_config or not train_data_config.get("pack_sequences", False):
+    if not train_data_config:
+        return
+    if not train_data_config.get("pack_sequences", False):
+        if train_data_config.get("int16_audio", False):
+            raise ValueError(
+                "train_ds.int16_audio needs train_ds.pack_sequences: only the sequence-packed batches carry int16 "
+                "audio, which the preprocessor's forward_packed converts."
+            )
         return
     if not hasattr(encoder, "forward_sequence_packed"):
         raise ValueError(
@@ -1686,9 +1693,11 @@ def _check_packed_training_config(
 
 
 def _refuse_sequence_packing(config, name: str):
-    """Raise if an evaluation dataset config asks for sequence packing, which only ``training_step`` handles."""
-    if config.get("pack_sequences", False):
-        raise ValueError(
-            f"{name}.pack_sequences: only the training step runs on sequence-packed batches; "
-            "evaluation needs padded batches. Remove pack_sequences from this config."
-        )
+    """Raise if an evaluation dataset config asks for sequence packing or int16 audio, which only ``training_step``
+    handles."""
+    for key in ("pack_sequences", "int16_audio"):
+        if config.get(key, False):
+            raise ValueError(
+                f"{name}.{key}: only the training step runs on sequence-packed batches (and their int16 audio); "
+                f"evaluation needs padded batches. Remove {key} from this config."
+            )

@@ -163,7 +163,8 @@ and ``training_step`` runs the preprocessor, ``ConformerEncoder.forward_sequence
 Fill such batches to a budget of encoder frames with ``use_packed_sequence_sampling: true`` and ``batch_tokens`` (see the Lhotse dataloading documentation).
 The model raises at setup for the settings the packed step does not support:
 
-* ``pack_sequences`` in ``validation_ds`` or ``test_ds``: evaluation runs on padded batches;
+* ``pack_sequences`` or ``int16_audio`` in ``validation_ds`` or ``test_ds``: evaluation runs on padded batches;
+* ``int16_audio`` in ``train_ds`` without ``pack_sequences``: only the packed batches carry int16 audio;
 * a Transformer encoder between encoder and decoder (``transf_encoder.num_layers`` above 0);
 * ``loss.predict_last_k`` other than 0, which would keep the last tokens of the whole packed batch;
 * an encoder without ``forward_sequence_packed`` (``ConformerEncoder`` has one);

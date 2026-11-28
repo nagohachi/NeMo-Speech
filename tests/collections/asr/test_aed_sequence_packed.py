@@ -114,6 +114,23 @@ def test_int16_audio_gives_the_float_features_on_cuda(asr_model, cuts):
 
 
 @pytest.mark.unit
+def test_int16_audio_without_pack_sequences_is_refused_at_setup(asr_model):
+    """Check that the model setup refuses train_ds.int16_audio without pack_sequences before building the loader."""
+    with pytest.raises(ValueError, match="train_ds.int16_audio needs train_ds.pack_sequences"):
+        asr_model.setup_training_data(OmegaConf.create({"use_lhotse": True, "int16_audio": True}))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", ["validation_ds", "test_ds"])
+def test_evaluation_data_refuses_int16_audio(asr_model, name):
+    """Check that evaluation datasets refuse int16_audio, which only the packed training batches carry."""
+    config = OmegaConf.create({"use_lhotse": True, "int16_audio": True})
+    setup = asr_model.setup_validation_data if name == "validation_ds" else asr_model.setup_test_data
+    with pytest.raises(ValueError, match=f"{name}.int16_audio"):
+        setup(config)
+
+
+@pytest.mark.unit
 def test_int16_audio_needs_pack_sequences(asr_model):
     """Check that int16_audio without pack_sequences raises: only the packed batches carry int16 audio."""
     with pytest.raises(ValueError, match="int16_audio needs pack_sequences"):

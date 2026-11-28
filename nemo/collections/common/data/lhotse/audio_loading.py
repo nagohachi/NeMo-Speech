@@ -68,13 +68,13 @@ def configure_dataset_audio_loading(dataset, enabled: bool):
     return configure(enabled) if callable(configure) else dataset
 
 
-def read_unpadded_audio_rows(cuts: CutSet, load_audio: AudioSamples, *, dtype: torch.dtype = torch.float32):
+def read_unpadded_audio_rows(cuts: CutSet, load_audio: AudioSamples, *, int16: bool = False):
     """Load the mono waveform of every cut without padded collation.
 
     Returns the waveforms, one 1D tensor per surviving cut, and the cuts that loaded;
     with a fault-tolerant ``load_audio`` the cuts that fail to load are dropped from both.
 
-    ``dtype`` float32 gives Lhotse's samples in [-1, 1). ``dtype`` int16 decodes the 16-bit integer samples
+    By default the rows are Lhotse's float32 samples in [-1, 1). ``int16`` decodes the 16-bit integer samples
     with soundfile instead, half the bytes to collate, pin and copy to the GPU; divided by 32768
     (``INT16_AUDIO_SCALE`` of the preprocessor that converts them) they are the float32 samples bit for bit.
     It reads mono 16-bit PCM recordings from a file or from memory as Lhotse would
@@ -82,12 +82,10 @@ def read_unpadded_audio_rows(cuts: CutSet, load_audio: AudioSamples, *, dtype: t
     (several sources or channels, audio transforms, resampling, video, other source types, other sample formats),
     also when ``load_audio`` is fault-tolerant.
     """
-    if dtype not in (torch.float32, torch.int16):
-        raise ValueError(f"Unpadded audio rows are float32 or int16, got {dtype}.")
     if load_audio.use_batch_loader and load_audio.ais_batch_loader is not None:
         cuts = load_audio.ais_batch_loader(cuts)
     executor = _get_executor(load_audio.num_workers, executor_type=load_audio._executor_type)
-    if dtype == torch.int16:
+    if int16:
         return _read_int16_rows(cuts, executor, suppress_errors=load_audio.fault_tolerant)
     audios, surviving = read_audio_from_cuts(
         cuts,
