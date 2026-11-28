@@ -606,15 +606,15 @@ class ASRTarredDatasetBuilder:
 
     def _write_to_tar(
         self, tar, audio_filepath: str, squashed_filename: str, duration: float = None, offset: float = 0
-    ) -> None:
-        codec = self.config.force_codec
-        to_transcode = not (codec is None or audio_filepath.endswith(f".{codec}"))
+    ) -> str:
+        """Add the audio to ``tar`` and return the name of its member (see ``_get_tar_member_name``)."""
         to_crop = not (duration is None and offset == 0)
+        output_format = self._resolve_output_format(audio_filepath, cropped=to_crop)
 
-        if not to_crop and not to_transcode:
+        if output_format is None:
             # Add existing file without transcoding, trimming, or re-encoding.
             tar.add(audio_filepath, arcname=squashed_filename)
-            return
+            return squashed_filename
 
         # Standard processing: read, trim, and transcode the audio file
         with soundfile.SoundFile(audio_filepath) as f:
@@ -625,28 +625,18 @@ class ASRTarredDatasetBuilder:
         num_frames = int(duration * sampling_rate) if duration else -1
         audio, sampling_rate = soundfile.read(audio_filepath, start=start_sample, frames=num_frames)
 
-        # Determine codec parameters.
-        if codec is not None:
-            if codec == "opus":
-                kwargs = {"format": "ogg", "subtype": "opus"}
-            else:
-                kwargs = {"format": codec}
-        else:
-            codec = soundfile.info(audio_filepath).format.lower()
-            kwargs = {"format": codec}
-
         # Transcode and write audio to tar.
+        extension, format_kwargs = output_format
         encoded_audio = BytesIO()
-        soundfile.write(encoded_audio, audio, sampling_rate, closefd=False, **kwargs)
-
-        # Generate filename with the appropriate extension.
-        encoded_squashed_filename = f"{squashed_filename.split('.')[0]}.{codec}"
+        soundfile.write(encoded_audio, audio, sampling_rate, closefd=False, **format_kwargs)
 
         # Add the in-memory audio file to the tar archive.
-        ti = tarfile.TarInfo(encoded_squashed_filename)
+        member_name = f"{squashed_filename.split('.')[0]}.{extension}"
+        ti = tarfile.TarInfo(member_name)
         encoded_audio.seek(0)
         ti.size = len(encoded_audio.getvalue())
         tar.addfile(ti, encoded_audio)
+        return member_name
 
     def _create_shard(self, entries, target_dir, shard_id, manifest_folder: str = None, only_manifests: bool = False):
         """Creates a tarball containing the audio files from `entries`."""
@@ -671,6 +661,11 @@ class ASRTarredDatasetBuilder:
                 audio_filepath = os.path.join(manifest_folder, entry["audio_filepath"])
                 if not os.path.exists(audio_filepath):
                     raise FileNotFoundError(f"Could not find {entry['audio_filepath']}!")
+            # only_manifests names members after the path in the manifest, but reads the format of cropped audio
+            # from the file, which a relative path names from the manifest folder
+            source_filepath = audio_filepath
+            if only_manifests and manifest_folder and not os.path.exists(audio_filepath):
+                source_filepath = os.path.join(manifest_folder, audio_filepath)
 
             base, ext = os.path.splitext(audio_filepath)
             base = base.replace('/', '_')
@@ -706,8 +701,10 @@ class ASRTarredDatasetBuilder:
                 entry_duration = "_".join(entry_duration)
 
                 to_write = base + "_" + entry_offset + "_" + entry_duration + ext
-                if not only_manifests:
-                    self._write_to_tar(
+                if only_manifests:
+                    to_write = self._get_tar_member_name(source_filepath, to_write, cropped=True)
+                else:
+                    to_write = self._write_to_tar(
                         tar, audio_filepath, to_write, duration=entry['duration'], offset=entry['offset']
                     )
                 count[squashed_filename] += 1
@@ -715,13 +712,15 @@ class ASRTarredDatasetBuilder:
                 entry['source_audio_offset'] = entry['offset']
                 del entry['offset']
             else:
+                member_name = self._get_tar_member_name(audio_filepath, squashed_filename, cropped=False)
                 if squashed_filename not in count:
                     if not only_manifests:
                         self._write_to_tar(tar, audio_filepath, squashed_filename)
-                    to_write = squashed_filename
+                    to_write = member_name
                     count[squashed_filename] = 1
                 else:
-                    to_write = base + "-sub" + str(count[squashed_filename]) + ext
+                    # names the same member as the first entry of the file (see nemo_tar_audio_member_name)
+                    to_write = base + "-sub" + str(count[squashed_filename]) + os.path.splitext(member_name)[1]
                     count[squashed_filename] += 1
 
             if only_manifests:
@@ -738,6 +737,43 @@ class ASRTarredDatasetBuilder:
         if not only_manifests:
             tar.close()
         return new_entries
+
+    def _get_tar_member_name(self, audio_filepath: str, squashed_filename: str, cropped: bool) -> str:
+        """Return the name under which ``_write_to_tar`` stores the audio of ``audio_filepath``.
+
+        Audio that is cropped or transcoded is re-encoded and takes the extension of its codec,
+        ``force_codec`` or else the format of the source file; other audio keeps ``squashed_filename``.
+        The manifest entries name the same member, so a tarred dataset with a forced codec stays readable.
+        """
+        output_format = self._resolve_output_format(audio_filepath, cropped=cropped)
+        if output_format is None:
+            return squashed_filename
+        extension, _ = output_format
+        return f"{squashed_filename.split('.')[0]}.{extension}"
+
+    def _resolve_output_format(self, audio_filepath: str, cropped: bool) -> tuple[str, dict] | None:
+        """Return the extension and the ``soundfile.write`` format arguments of the re-encoded audio.
+
+        Returns ``None`` when the file is stored as it is: it is not cropped, and ``force_codec`` is unset or
+        already its extension. Raises ``FileNotFoundError`` when the output format is the format of a source file
+        that does not exist (``only_manifests`` without the audio), since the member name would be a guess.
+        """
+        codec = self.config.force_codec
+        if codec is None:
+            if not cropped:
+                return None
+            if not os.path.exists(audio_filepath):
+                raise FileNotFoundError(
+                    f"Could not find {audio_filepath}: without force_codec, cropped audio is re-encoded in the format "
+                    "of its source file, which is needed to name its tar member."
+                )
+            source_format = soundfile.info(audio_filepath).format.lower()
+            return source_format, {"format": source_format}
+        if not cropped and audio_filepath.endswith(f".{codec}"):
+            return None
+        if codec == "opus":
+            return codec, {"format": "ogg", "subtype": "opus"}
+        return codec, {"format": codec}
 
     @classmethod
     def setup_history(cls, base_metadata: ASRTarredDatasetMetadata, history: List[Any]):
