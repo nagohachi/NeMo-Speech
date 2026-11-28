@@ -647,12 +647,12 @@ class TestPackedConvSubsamplingChannelsLast:
         with monkeypatch.context() as patch:
             patch.setattr(torch.compiler, "is_exporting", lambda: True)
             assert not stack.can_run_triton(x)
-        deterministic = torch.are_deterministic_algorithms_enabled()
+        were_deterministic_algorithms_enabled = torch.are_deterministic_algorithms_enabled()
         torch.use_deterministic_algorithms(True)
         try:
             assert not stack.can_run_triton(x)
         finally:
-            torch.use_deterministic_algorithms(deterministic)
+            torch.use_deterministic_algorithms(were_deterministic_algorithms_enabled)
         assert stack.can_run_triton(x)
 
     @pytest.mark.unit
@@ -663,11 +663,11 @@ class TestPackedConvSubsamplingChannelsLast:
         monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
         module, features, lengths = _make_cuda_packed_case()
         calls = []
-        channels_last = subsampling_module.ConvSubsampling._forward_packed_group_channels_last
+        original_forward_channels_last = subsampling_module.ConvSubsampling._forward_packed_group_channels_last
         monkeypatch.setattr(
             subsampling_module.ConvSubsampling,
             "_forward_packed_group_channels_last",
-            lambda *args, **kwargs: calls.append(1) or channels_last(*args, **kwargs),
+            lambda *args, **kwargs: calls.append(1) or original_forward_channels_last(*args, **kwargs),
         )
         (out, grads), (reference, reference_grads) = (
             _run_packed_subsampling(module, features.requires_grad_(input_grad), lengths, channels_last=path)
