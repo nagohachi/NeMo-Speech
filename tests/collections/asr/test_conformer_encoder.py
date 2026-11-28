@@ -618,6 +618,18 @@ class TestPackedConformerConvolution:
         torch.testing.assert_close(packed_in.grad[valid], padded_in.grad[valid])
 
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "kernel_size,stride,padding,expected",
+        [(5, 1, None, (4, 0)), (3, 2, None, (2, 1)), (5, 1, 2, (2, 2)), (4, 1, [1, 2], (1, 2))],
+        ids=["causal", "causal_strided", "symmetric", "asymmetric"],
+    )
+    def test_causal_conv1d_reports_its_padding(self, kernel_size, stride, padding, expected):
+        """Check that CausalConv1D reports the zero frames it adds before and after its input, for the causal
+        default, a stride, an integer and a [left, right] padding."""
+        conv = CausalConv1D(4, 4, kernel_size, stride=stride, padding=padding)
+        assert (conv.left_padding, conv.right_padding) == expected
+
+    @pytest.mark.unit
     def test_packed_row_kernel_runs_only_the_depthwise_convolution_it_covers(self, monkeypatch):
         """Check the choice of the packed row kernel: a CausalConv1D depthwise convolution of the module on CUDA
         with Triton; the CPU, a missing Triton, another convolution class, a stride or a dilation take the gapped
