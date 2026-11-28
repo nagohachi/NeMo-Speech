@@ -27,6 +27,7 @@ from nemo.collections.asr.parts.packed_sequence import (
 )
 from nemo.collections.asr.parts.submodules import packed_attention as packed_attention_module
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
+    MultiHeadAttention,
     RelPositionalEncoding,
     RelPositionMultiHeadAttention,
     RelPositionMultiHeadAttentionLongformer,
@@ -649,6 +650,38 @@ def _cuda_param():
         "cuda",
         marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")],
     )
+
+
+class TestPackedAttentionAutocast:
+    @pytest.mark.unit
+    def test_matches_padded_under_cpu_bf16_autocast(self):
+        """Check that the projections of the packed path run in the autocast dtype of the device of the input,
+        with the outputs of the padded path."""
+        torch.manual_seed(3)
+        attention = MultiHeadAttention(n_head=2, n_feat=8, dropout_rate=0.0)
+        lengths = torch.tensor([7, 3, 11])
+        x = torch.randn(3, 11, 8)
+        pad = torch.arange(11)[None, :] >= lengths[:, None]
+        mask = pad[:, None, :] | pad[:, :, None]
+        packed = pack_encoder_output(x, lengths)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            padded_out = attention(query=x, key=x, value=x, mask=mask)
+            packed_out = attention.forward_packed(packed.data, PackedAttentionContext(packed))
+        assert packed_out.dtype == padded_out.dtype == torch.bfloat16
+        torch.testing.assert_close(packed_out, _valid_frames(padded_out, lengths), rtol=2e-2, atol=2e-2)
+
+    @pytest.mark.unit
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_cpu_input_ignores_cuda_autocast(self):
+        """Check that CUDA autocast leaves a CPU input, and CPU weights, in float32."""
+        attention = MultiHeadAttention(n_head=2, n_feat=8, dropout_rate=0.0)
+        context = PackedAttentionContext.from_lengths(torch.tensor([4, 2]))
+        x = torch.randn(6, 8)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = attention.forward_packed(x, context)
+        assert out.dtype == torch.float32
+        torch.testing.assert_close(out, attention.forward_packed(x, context))
 
 
 class TestPackedCrossAttention:

@@ -493,6 +493,39 @@ class TestPackedConvSubsampling:
         torch.testing.assert_close(_valid_frames(packed_features.grad, lengths), _valid_frames(features.grad, lengths))
 
     @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "module",
+        [
+            _strided_subsampling,
+            lambda: ConvSubsampling("striding", 4, 8, 12, 4),
+            lambda: ConvSubsampling("dw_striding", 8, 8, 12, 4),
+        ],
+        ids=["strides_1_3_2_pool", "striding_4", "dw_striding_8"],
+    )
+    def test_gap_values_reach_no_output_or_gradient(self, module):
+        """Check, with random biases that leave values in the gaps between utterances (a 1x1 convolution before a
+        depthwise one, an activation before a strided convolution), that forward_packed matches forward."""
+        module = module().double()
+        torch.manual_seed(1)
+        for layer in module.modules():
+            if isinstance(layer, (torch.nn.Conv2d, torch.nn.Linear)) and layer.bias is not None:
+                torch.nn.init.normal_(layer.bias)
+        lengths = torch.tensor([37, 1, 12, 36, 6])
+        features = _packed_test_features(lengths).requires_grad_()
+        padded_out, padded_lengths = module(x=features, lengths=lengths)
+        packed_features = features.detach().clone().requires_grad_()
+        packed_out = module.forward_packed(pack_encoder_output(packed_features, lengths))
+        torch.testing.assert_close(packed_out.data, _valid_frames(padded_out, padded_lengths))
+
+        _valid_frames(padded_out, padded_lengths).square().sum().backward()
+        reference_grads = {name: p.grad.clone() for name, p in module.named_parameters()}
+        module.zero_grad()
+        packed_out.data.square().sum().backward()
+        torch.testing.assert_close(_valid_frames(packed_features.grad, lengths), _valid_frames(features.grad, lengths))
+        for name, p in module.named_parameters():
+            torch.testing.assert_close(p.grad, reference_grads[name], msg=name)
+
+    @pytest.mark.unit
     def test_sequence_groups_match_one_group(self):
         module = _strided_subsampling().double()
         lengths = torch.tensor([37, 1, 12, 36, 6])
@@ -525,6 +558,23 @@ class TestPackedConvSubsampling:
             assert out.host_lengths.device.type == "cpu"
             assert torch.equal(out.host_lengths, out.lengths)
             assert out.max_seqlen == int(out.lengths.max())
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "layer, reads",
+        [
+            (torch.nn.Conv2d(2, 2, kernel_size=3, stride=2, padding=1), True),
+            (torch.nn.Conv2d(2, 2, kernel_size=3, stride=2, padding=1, groups=2), True),
+            (torch.nn.Conv2d(2, 2, kernel_size=(1, 3), padding=(0, 1)), False),
+            (torch.nn.Conv2d(2, 2, kernel_size=1), False),
+            (torch.nn.Conv2d(2, 2, kernel_size=1, padding=(1, 0)), True),
+            (torch.nn.MaxPool2d(kernel_size=(1, 2), stride=(1, 2)), False),
+            (torch.nn.ReLU(), False),
+        ],
+    )
+    def test_reads_neighbouring_frames_detects_time_kernel_and_padding(self, layer, reads):
+        """Check that a layer reads neighbouring frames when its time kernel is above one or it pads in time."""
+        assert subsampling_module._reads_neighbouring_frames(layer) is reads
 
     @pytest.mark.unit
     def test_rejects_unsupported_stacks(self):
