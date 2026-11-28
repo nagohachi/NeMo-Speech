@@ -25,6 +25,7 @@ __all__ = [
     "PackedEncoderActivations",
     "PackedSlotLayout",
     "compile_forward_packed",
+    "compile_packed_function",
     "compile_without_ddp_optimizer",
     "lengths_to_cu_seqlens",
     "pack_encoder_output",
@@ -341,6 +342,15 @@ def packed_slot_layout(packed: PackedEncoderActivations, *, alignment: int = 1, 
 
 
 @functools.cache
+def compile_packed_function(function):
+    """Return ``function`` through ``torch.compile`` with dynamic sizes, compiled once for every caller.
+
+    Inside ``DistributedDataParallel`` the graphs are compiled whole (see ``compile_without_ddp_optimizer``).
+    """
+    return compile_without_ddp_optimizer(function)
+
+
+@functools.cache
 def compile_forward_packed():
     """Return ``run(module, *args, **kwargs)``, which calls ``module.forward_packed`` through ``torch.compile``.
 
@@ -352,11 +362,7 @@ def compile_forward_packed():
     option is on. Inside ``DistributedDataParallel`` the layer graphs are compiled whole
     (see ``compile_without_ddp_optimizer``).
     """
-
-    def forward_packed(module, *args, **kwargs):
-        return module.forward_packed(*args, **kwargs)
-
-    return compile_without_ddp_optimizer(forward_packed)
+    return compile_packed_function(_call_forward_packed)
 
 
 def compile_without_ddp_optimizer(fn):
@@ -514,3 +520,8 @@ def _new_packed_encoder_activations(
 def _calc_slot_lengths(lengths: Tensor, alignment: int, gap: int) -> Tensor:
     """Return the slots of every utterance in ``packed_slot_layout``: ``ceil((L + gap) / alignment) * alignment``."""
     return torch.div(lengths + (gap + alignment - 1), alignment, rounding_mode="floor") * alignment
+
+
+def _call_forward_packed(module, *args, **kwargs):
+    """Call ``module.forward_packed``; the function that ``compile_forward_packed`` compiles."""
+    return module.forward_packed(*args, **kwargs)

@@ -21,3 +21,4 @@ from nemo.collections.asr.parts import packed_sequence as packed_sequence_module
 def clear_packed_compile_caches():
     """Clear the cached compiled packed functions, so that the next call compiles, and checks, them again."""
     packed_sequence_module.compile_forward_packed.cache_clear()
+    packed_sequence_module.compile_packed_function.cache_clear()

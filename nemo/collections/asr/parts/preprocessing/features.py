@@ -43,7 +43,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from nemo.collections.asr.parts.packed_sequence import PackedEncoderActivations, _new_packed_encoder_activations
+from nemo.collections.asr.parts.packed_sequence import (
+    PackedEncoderActivations,
+    _new_packed_encoder_activations,
+    compile_packed_function,
+)
 from nemo.collections.asr.parts.preprocessing.perturb import AudioAugmentor
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
 from nemo.collections.common.parts.utils import build_module
@@ -307,6 +311,7 @@ class FilterbankFeatures(nn.Module):
         periodic_window: bool = False,
         snip_edges: bool = False,
         log_base: Optional[float] = None,
+        compile_packed: bool = False,
         stft_exact_pad=False,  # Deprecated arguments; kept for config compatibility
         stft_conv=False,  # Deprecated arguments; kept for config compatibility
     ):
@@ -432,6 +437,12 @@ class FilterbankFeatures(nn.Module):
             self.forward = torch.no_grad()(self.forward)
             self.forward_packed = torch.no_grad()(self.forward_packed)
         self._rng = random.Random() if rng is None else rng
+        # forward_packed runs its device work before and after the STFT through torch.compile
+        self.compile_packed = compile_packed
+        if compile_packed:
+            # raises for a PyTorch it cannot patch now, not at the first training step
+            for function in (_guard_packed_waveforms, _calc_packed_power_spectra, _calc_packed_log_mel):
+                compile_packed_function(function)
         self.nb_augmentation_prob = nb_augmentation_prob
         if self.nb_augmentation_prob > 0.0:
             if nb_max_freq >= sample_rate / 2:
@@ -491,6 +502,10 @@ class FilterbankFeatures(nn.Module):
         pad_amount = self.stft_pad_amount * 2 if self.stft_pad_amount is not None else self.n_fft // 2 * 2
         seq_len = torch.floor_divide((seq_len + pad_amount - self.n_fft), self.hop_length)
         return seq_len.to(dtype=torch.long)
+
+    def _get_packed_function(self, function):
+        """Return ``function`` itself, or compiled with dynamic sizes when ``compile_packed`` is on."""
+        return compile_packed_function(function) if self.compile_packed else function
 
     def _signal_padding(self) -> tuple[int, int]:
         """Zeros before and after the signal that give ``torch.stft(center=False)`` the configured framing."""
@@ -555,43 +570,33 @@ class FilterbankFeatures(nn.Module):
         block_lengths = _round_up(seq_len + pad_left + pad_right, self.hop_length)
         block_offsets = torch.cat([seq_len.new_zeros(1), block_lengths.cumsum(0)])
         guarded_size = int(_round_up(host_seq_len + pad_left + pad_right, self.hop_length).sum())
-        guarded = x.new_zeros(guarded_size)
-
-        guarded_positions = torch.arange(x.numel(), device=x.device)
-        sample_sequence_ids = torch.bucketize(guarded_positions, cu_seqlens[1:], right=True)
-        guarded_positions -= cu_seqlens[sample_sequence_ids]
-        guarded_positions += block_offsets[sample_sequence_ids] + pad_left
-
-        if self.stft_pad_amount is None:
-            samples = _dither_and_preemphasize_packed(
-                x, cu_seqlens, self.preemph, self.dither if self.training else 0.0
-            )
-            guarded[guarded_positions] = samples
-        else:
-            guarded[guarded_positions] = x
-            guarded = _dither_and_preemphasize_exact_pad_blocks(
-                guarded,
-                seq_len,
-                block_lengths,
-                block_offsets,
-                self.preemph,
-                self.dither if self.training else 0.0,
-            )
-        del guarded_positions, sample_sequence_ids
+        dither = self.dither if self.training else 0.0
+        # the dither noise is drawn here, outside the compiled functions, so that the same seed gives the same noise
+        # with and without compile_packed:
+        # one per waveform sample, or one per guarded sample when the exact padding dithers the guarded signal
+        noise = None
+        if dither > 0:
+            num_noise_samples = x.numel() if self.stft_pad_amount is None else guarded_size
+            noise = torch.randn(num_noise_samples, dtype=x.dtype, device=x.device)
+        guarded = self._get_packed_function(_guard_packed_waveforms)(
+            x,
+            noise,
+            lengths=seq_len,
+            cu_seqlens=cu_seqlens,
+            block_lengths=block_lengths,
+            block_offsets=block_offsets,
+            guarded_size=guarded_size,
+            pad_left=pad_left,
+            preemph=self.preemph,
+            dither=dither,
+            exact_pad=self.stft_pad_amount is not None,
+        )
 
         with torch.amp.autocast(x.device.type, enabled=False):
             spectra = self.stft(guarded.unsqueeze(0), center=False)[0]
+        del guarded
 
-        frame_cu_seqlens = torch.cat([feature_lengths.new_zeros(1), feature_lengths.cumsum(0)])
-        frame_indices = torch.arange(total_frames, device=x.device)
-        frame_sequence_ids = torch.bucketize(frame_indices, frame_cu_seqlens[1:], right=True)
-        local_frames = frame_indices - frame_cu_seqlens[frame_sequence_ids]
-        global_frames = torch.div(block_offsets[frame_sequence_ids], self.hop_length, rounding_mode="floor")
-        global_frames = global_frames + local_frames
-        spectra = spectra.index_select(-1, global_frames).transpose(0, 1)
-
-        guard_value = 0 if not self.use_grads else CONSTANT
-        spectra = torch.sqrt(torch.view_as_real(spectra).pow(2).sum(-1) + guard_value)
+        narrowband = None
         if self.training and self.nb_augmentation_prob > 0.0:
             narrowband = torch.tensor(
                 self._rng.choices(
@@ -601,10 +606,18 @@ class FilterbankFeatures(nn.Module):
                 ),
                 device=x.device,
             )
-            keep = ~(narrowband[frame_sequence_ids].unsqueeze(1) & _high_frequency_mask(spectra, self._nb_max_fft_bin))
-            spectra = spectra * keep
-        if self.mag_power != 1.0:
-            spectra = spectra.pow(self.mag_power)
+        # the compiled function takes the real view: complex tensors are not supported by the compiler
+        spectra, frame_sequence_ids = self._get_packed_function(_calc_packed_power_spectra)(
+            torch.view_as_real(spectra),
+            lengths=feature_lengths,
+            block_offsets=block_offsets,
+            total_frames=total_frames,
+            hop_length=self.hop_length,
+            guard_value=0 if not self.use_grads else CONSTANT,
+            narrowband=narrowband,
+            nb_max_fft_bin=self._nb_max_fft_bin if narrowband is not None else 0,
+            mag_power=self.mag_power,
+        )
         if linear_spec:
             return _make_packed_features(
                 spectra,
@@ -615,23 +628,21 @@ class FilterbankFeatures(nn.Module):
                 host_lengths=host_feature_lengths,
             )
 
-        with torch.amp.autocast(x.device.type, enabled=False):
-            features = torch.matmul(self.fb.to(spectra.dtype), spectra.transpose(0, 1).unsqueeze(0))[0].transpose(0, 1)
-        if self.log:
-            if self.log_zero_guard_type == "add":
-                features = torch.log(features + self.log_zero_guard_value_fn(features))
-            elif self.log_zero_guard_type == "clamp":
-                features = torch.log(torch.clamp(features, min=self.log_zero_guard_value_fn(features)))
-            else:
-                raise ValueError("log_zero_guard_type was not understood")
-            if self.log_base is not None:
-                features = features * (1.0 / math.log(self.log_base))
-        if self.frame_splicing > 1:
-            features = features.repeat(1, self.frame_splicing)
+        features = self._get_packed_function(_calc_packed_log_mel)(
+            spectra,
+            fb=self.fb,
+            lengths=feature_lengths,
+            sequence_ids=frame_sequence_ids,
+            log=self.log,
+            log_zero_guard_type=self.log_zero_guard_type,
+            # forward evaluates the guard only with the logarithm
+            log_zero_guard_value=self.log_zero_guard_value_fn(spectra) if self.log else None,
+            log_base=self.log_base,
+            frame_splicing=self.frame_splicing,
+            normalize=None if self.norm is not None else self.normalize,
+        )
         if self.norm is not None:
             features = self.norm.forward_packed(features)
-        elif self.normalize:
-            features = _normalize_packed_features(features, feature_lengths, frame_sequence_ids, self.normalize)
         return _make_packed_features(
             features,
             feature_lengths,
@@ -794,8 +805,84 @@ def _dense_feature_width(lengths, pad_to, max_length, extra_frame: bool = True):
     return width
 
 
-def _dither_and_preemphasize_packed(x, cu_seqlens, preemph, dither):
-    samples = x + dither * torch.randn_like(x) if dither > 0 else x
+def _guard_packed_waveforms(
+    x, noise, lengths, cu_seqlens, block_lengths, block_offsets, guarded_size, pad_left, preemph, dither, exact_pad
+):
+    """Place the packed waveforms in hop-aligned blocks with their zero guards, dithered and pre-emphasized:
+    the signal of the single STFT of ``FilterbankFeatures.forward_packed``."""
+    guarded = x.new_zeros(guarded_size)
+    positions = torch.arange(x.numel(), device=x.device)
+    # the utterance of every sample; the boundaries are all of cu_seqlens, not cu_seqlens[1:]: Inductor's bucketize
+    # drops the offset of a sliced boundary tensor with dynamic sizes (torch 2.12) and reads cu_seqlens[:-1]
+    sample_sequence_ids = torch.bucketize(positions, cu_seqlens, right=True) - 1
+    positions = positions - cu_seqlens[sample_sequence_ids] + block_offsets[sample_sequence_ids] + pad_left
+    if not exact_pad:
+        guarded[positions] = _dither_and_preemphasize_packed(x, cu_seqlens, preemph, dither, noise)
+        return guarded
+    guarded[positions] = x
+    return _dither_and_preemphasize_exact_pad_blocks(
+        guarded, lengths, block_lengths, block_offsets, preemph, dither, noise
+    )
+
+
+def _calc_packed_power_spectra(
+    spectra, lengths, block_offsets, total_frames, hop_length, guard_value, narrowband, nb_max_fft_bin, mag_power
+):
+    """Return the magnitudes of the valid frames of the single STFT ``(n_fft // 2 + 1, frames, 2)`` (real view)
+    as ``(total_frames, bins)`` to the power ``mag_power``, with the high bins of the ``narrowband`` utterances
+    zeroed; and the utterance of every frame."""
+    frame_cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(0)])
+    frame_indices = torch.arange(total_frames, device=spectra.device)
+    # the full prefix sums as boundaries, as in _guard_packed_waveforms
+    frame_sequence_ids = torch.bucketize(frame_indices, frame_cu_seqlens, right=True) - 1
+    local_frames = frame_indices - frame_cu_seqlens[frame_sequence_ids]
+    global_frames = torch.div(block_offsets[frame_sequence_ids], hop_length, rounding_mode="floor") + local_frames
+    spectra = spectra.index_select(1, global_frames).transpose(0, 1)
+    spectra = torch.sqrt(spectra.pow(2).sum(-1) + guard_value)
+    if narrowband is not None:
+        spectra = spectra * ~(
+            narrowband[frame_sequence_ids].unsqueeze(1) & _high_frequency_mask(spectra, nb_max_fft_bin)
+        )
+    if mag_power != 1.0:
+        spectra = spectra.pow(mag_power)
+    return spectra, frame_sequence_ids
+
+
+def _calc_packed_log_mel(
+    spectra,
+    fb,
+    lengths,
+    sequence_ids,
+    log,
+    log_zero_guard_type,
+    log_zero_guard_value,
+    log_base,
+    frame_splicing,
+    normalize,
+):
+    """Compute the mel features ``(total_frames, nfilt * frame_splicing)`` of the power spectra of the valid
+    frames: the filter bank, the logarithm, the splicing and the built-in normalization (``normalize``; None for
+    none)."""
+    with torch.amp.autocast(spectra.device.type, enabled=False):
+        features = torch.matmul(fb.to(spectra.dtype), spectra.transpose(0, 1).unsqueeze(0))[0].transpose(0, 1)
+    if log:
+        if log_zero_guard_type == "add":
+            features = torch.log(features + log_zero_guard_value)
+        elif log_zero_guard_type == "clamp":
+            features = torch.log(torch.clamp(features, min=log_zero_guard_value))
+        else:
+            raise ValueError("log_zero_guard_type was not understood")
+        if log_base is not None:
+            features = features * (1.0 / math.log(log_base))
+    if frame_splicing > 1:
+        features = features.repeat(1, frame_splicing)
+    if normalize:
+        features = _normalize_packed_features(features, lengths, sequence_ids, normalize)
+    return features
+
+
+def _dither_and_preemphasize_packed(x, cu_seqlens, preemph, dither, noise):
+    samples = x + dither * noise if dither > 0 else x
     if preemph is None or samples.numel() == 0:
         return samples
     emphasized = torch.cat([samples[:1], samples[1:] - preemph * samples[:-1]])
@@ -807,9 +894,9 @@ def _dither_and_preemphasize_packed(x, cu_seqlens, preemph, dither):
     return torch.where(start_mask[:-1], samples, emphasized)
 
 
-def _dither_and_preemphasize_exact_pad_blocks(guarded, lengths, block_lengths, block_offsets, preemph, dither):
+def _dither_and_preemphasize_exact_pad_blocks(guarded, lengths, block_lengths, block_offsets, preemph, dither, noise):
     if dither > 0:
-        guarded = guarded + dither * torch.randn_like(guarded)
+        guarded = guarded + dither * noise
     if preemph is not None and guarded.numel() > 0:
         emphasized = torch.cat([guarded[:1], guarded[1:] - preemph * guarded[:-1]])
         starts = block_offsets[:-1]

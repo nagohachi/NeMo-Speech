@@ -153,6 +153,9 @@ model:
     dither: 0.00001
     pad_to: 0
     pad_value: 0.0
+    # with train_ds.pack_sequences: run the device work of the sequence-packed frontend before and after its STFT
+    # through torch.compile (the padded forward stays eager)
+    # compile_packed: true
 
   # SpecAugment is applied either in the model or in the data layer
   spec_augment:

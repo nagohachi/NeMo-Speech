@@ -36,6 +36,7 @@ from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.core.utils import numba_utils
 from nemo.core.utils.numba_utils import __NUMBA_MINIMUM_VERSION__
 from nemo.utils import config_utils, logging
+from tests.collections.asr.packed_compile_test_utils import clear_packed_compile_caches
 
 
 class TestASRModulesBasicTests:
@@ -220,6 +221,115 @@ class TestASRModulesBasicTests:
                 rtol=1e-3,
                 atol=5e-4,
             )
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        ("exact_pad", "preemph", "normalize", "frame_splicing"),
+        [
+            (False, 0.97, "per_feature", 1),
+            (False, None, "all_features", 2),
+            (True, 0.97, None, 1),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "device",
+        [
+            pytest.param("cpu", marks=pytest.mark.skipif(torch.cuda.is_available(), reason="the CUDA case covers it")),
+            pytest.param(
+                "cuda",
+                marks=[pytest.mark.gpu, pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")],
+            ),
+        ],
+    )
+    def test_AudioToMelSpectrogramPreprocessor_compiled_packed_matches_eager(
+        self, exact_pad, preemph, normalize, frame_splicing, device
+    ):
+        """Check that compile_packed in training mode (dither on) gives the eager frontend's features up to float32
+        rounding for two batches of different sizes, from graphs without breaks that the second batch reuses."""
+        preprocessor_kwargs = dict(
+            normalize=normalize,
+            dither=1e-5,
+            pad_to=0,
+            exact_pad=exact_pad,
+            preemph=preemph,
+            frame_splicing=frame_splicing,
+        )
+        eager_preprocessor = modules.AudioToMelSpectrogramPreprocessor(**preprocessor_kwargs).train().to(device)
+        compiled_preprocessor = (
+            modules.AudioToMelSpectrogramPreprocessor(**preprocessor_kwargs, compile_packed=True).train().to(device)
+        )
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        _assert_compiled_packed_frontend_matches_eager(eager_preprocessor, compiled_preprocessor, device)
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "options",
+        [
+            dict(nb_augmentation_prob=0.5, nb_max_freq=4000),
+            dict(log_zero_guard_type="clamp"),
+            dict(mag_power=1.0),
+            dict(linear_spec=True),
+            dict(dither=0.0),
+            dict(eval_mode=True),
+            dict(
+                normalize={
+                    "_target_": "nemo.collections.asr.parts.submodules.batchnorm.MaskedBatchNorm1d",
+                    "affine": False,
+                }
+            ),
+        ],
+        ids=["narrowband", "clamp", "mag_power_1", "linear_spec", "no_dither", "eval_mode", "norm_block"],
+    )
+    def test_AudioToMelSpectrogramPreprocessor_compiled_packed_branches_match_eager(self, options):
+        """Check the branches of the compiled frontend that the default options skip against the eager frontend:
+        narrowband augmentation, the clamp guard of the logarithm, magnitudes without squaring, linear spectra, no
+        dither noise (without dither and in evaluation mode) and a normalization block after the compiled log-mel."""
+        options = dict(options)
+        linear_spec = options.pop("linear_spec", False)
+        eval_mode = options.pop("eval_mode", False)
+        preprocessor_kwargs = dict(dither=1e-5, pad_to=0) | options
+        eager_preprocessor = modules.AudioToMelSpectrogramPreprocessor(**preprocessor_kwargs).train(not eval_mode)
+        compiled_preprocessor = modules.AudioToMelSpectrogramPreprocessor(
+            **preprocessor_kwargs, compile_packed=True
+        ).train(not eval_mode)
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        _assert_compiled_packed_frontend_matches_eager(
+            eager_preprocessor, compiled_preprocessor, "cpu", linear_spec=linear_spec
+        )
+
+    @pytest.mark.unit
+    def test_AudioToMelSpectrogramPreprocessor_compile_packed_refuses_a_pytorch_without_optimize_ddp(
+        self, monkeypatch
+    ):
+        """Check that compile_packed raises when the preprocessor is built, not at the first packed batch, for a
+        PyTorch whose Dynamo config has no optimize_ddp to turn off."""
+        monkeypatch.delattr(torch._dynamo.config, "optimize_ddp")
+        clear_packed_compile_caches()
+        try:
+            with pytest.raises(RuntimeError, match="optimize_ddp"):
+                modules.AudioToMelSpectrogramPreprocessor(compile_packed=True)
+            modules.AudioToMelSpectrogramPreprocessor()  # without the option nothing is compiled or checked
+        finally:
+            clear_packed_compile_caches()
+
+    @pytest.mark.unit
+    def test_AudioToMelSpectrogramPreprocessor_packed_without_log_ignores_the_log_zero_guard(self):
+        """Check that without the logarithm the packed frontend, like forward, does not evaluate the zero guard of the
+        logarithm, so a value that the guard would refuse leaves the features of forward."""
+        preprocessor = modules.AudioToMelSpectrogramPreprocessor(
+            log=False, log_zero_guard_value="not a guard", dither=0.0, pad_to=0
+        ).eval()
+        lengths = torch.tensor([4000, 2500])
+        padded = torch.randn(2, 4000) * 0.1
+        expected, expected_lengths = preprocessor(input_signal=padded, length=lengths)
+        packed = torch.cat([padded[0], padded[1, :2500]])
+        cu_seqlens = torch.tensor([0, 4000, 6500])
+        actual = preprocessor.forward_packed(packed, lengths, cu_seqlens)
+        assert torch.equal(actual.lengths, expected_lengths)
+        expected_data = torch.cat([expected[i, :, :n].T for i, n in enumerate(expected_lengths.tolist())])
+        torch.testing.assert_close(actual.data, expected_data, rtol=1e-5, atol=1e-5)
 
     @pytest.mark.unit
     def test_AudioToMelSpectrogramPreprocessor_packed_waveform_validates_metadata(self):
@@ -1048,3 +1158,38 @@ class TestASRModulesBasicTests:
 
         # assert vocab size
         assert jointnet.num_classes_with_blank == vocab_size + 1
+
+
+def _assert_compiled_packed_frontend_matches_eager(
+    eager_preprocessor, compiled_preprocessor, device, linear_spec=False
+):
+    """Assert that two batches of different sizes give the eager features through the compiled packed frontend,
+    without graph breaks, and that the second batch compiles no new graph."""
+    graphs_per_batch = []
+    # three utterances or more in both batches: the graphs guard on that (contiguity checks of (B, ...) tensors),
+    # which packed training batches always meet
+    for lengths in ([4096, 2500, 701, 400], [3000, 1700, 900]):
+        lengths = torch.tensor(lengths, dtype=torch.long, device=device)
+        torch.manual_seed(3)
+        packed = torch.randn(int(lengths.sum()), device=device) * 0.1
+        cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(dim=0)])
+        outputs = []
+        for preprocessor in (eager_preprocessor, compiled_preprocessor):
+            torch.manual_seed(5)  # the same dither noise
+            # the same narrowband choices, drawn from the Python RNG of the featurizer: with seed 0 and probability
+            # 0.5 both batches mix narrowband utterances with full-band ones
+            preprocessor.featurizer._rng.seed(0)
+            if linear_spec:
+                outputs.append(
+                    preprocessor.featurizer.forward_packed(
+                        packed, lengths, cu_seqlens, linear_spec=True, host_seq_len=lengths.cpu()
+                    )
+                )
+            else:
+                outputs.append(preprocessor.forward_packed(packed, lengths, cu_seqlens, host_length=lengths.cpu()))
+        expected, actual = outputs
+        assert torch.equal(actual.lengths, expected.lengths)
+        torch.testing.assert_close(actual.data, expected.data, rtol=1e-4, atol=1e-4)
+        graphs_per_batch.append(torch._dynamo.utils.counters["stats"]["unique_graphs"])
+    assert not torch._dynamo.utils.counters["graph_break"]
+    assert graphs_per_batch[0] > 0 and graphs_per_batch[1] == graphs_per_batch[0], graphs_per_batch

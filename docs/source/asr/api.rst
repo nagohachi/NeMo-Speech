@@ -186,6 +186,10 @@ The first training steps take longer while the layers compile; batches of other 
 The values differ from the uncompiled layers by floating-point rounding, and dropout draws other random masks.
 The option cannot be combined with activation checkpointing of the encoder layers: the encoder raises an error.
 
+``model.preprocessor.compile_packed: true`` compiles the feature computation of the sequence-packed training step (``train_ds.pack_sequences``) with ``torch.compile``,
+which speeds up the preprocessor; the STFT itself is not compiled, and evaluation and decoding run the uncompiled padded frontend.
+The first training steps take longer while it compiles, and the features equal those of the uncompiled frontend up to floating-point rounding.
+
 .. _rnn-encoder-api:
 
 .. autoclass:: nemo.collections.asr.modules.RNNEncoder
