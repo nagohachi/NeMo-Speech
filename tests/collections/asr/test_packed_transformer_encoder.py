@@ -450,26 +450,34 @@ def test_flash_attention_varlen_uses_aten_without_flash_attn(monkeypatch):
     assert provider._sequence_packed_provider == "aten"
 
 
-@pytest.mark.parametrize("import_error", [ImportError, OSError])
-def test_flash_attention_varlen_falls_back_to_aten_for_a_broken_flash_attn(monkeypatch, import_error):
-    """Check that an installed flash-attn whose import fails, also with an error other than ImportError, falls
-    back to the ATen provider."""
+def test_flash_attention_varlen_falls_back_to_aten_with_a_warning_when_flash_attn_raises_import_error(monkeypatch):
+    """Check that an installed flash-attn whose import raises ImportError falls back to the ATen provider and logs
+    a warning."""
     _skip_without_aten_flash_attention()
-    original_import = builtins.__import__
-
-    def import_broken_flash_attn(name, *args, **kwargs):
-        if name == "flash_attn":
-            raise import_error("undefined symbol")
-        return original_import(name, *args, **kwargs)
-
+    warnings = []
     monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", True)
-    monkeypatch.setattr(builtins, "__import__", import_broken_flash_attn)
+    monkeypatch.setattr(builtins, "__import__", _make_import_raising(ImportError))
+    monkeypatch.setattr(transformer_encoder_utils_module.logging, "warning", warnings.append)
     transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
     try:
         provider = transformer_encoder_utils_module._get_flash_attention_varlen()
     finally:
         transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
     assert provider is transformer_encoder_utils_module._run_torch_flash_attention_varlen
+    assert len(warnings) == 1 and "cannot be imported" in warnings[0]
+
+
+def test_flash_attention_varlen_raises_other_errors_of_a_broken_flash_attn(monkeypatch):
+    """Check that an error other than ImportError from importing flash-attn, such as the OSError of a CUDA extension
+    built for another ABI, propagates instead of switching to the ATen provider."""
+    monkeypatch.setattr(transformer_encoder_utils_module, "_FLASH_ATTN_INSTALLED", True)
+    monkeypatch.setattr(builtins, "__import__", _make_import_raising(OSError))
+    transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
+    try:
+        with pytest.raises(OSError, match="undefined symbol"):
+            transformer_encoder_utils_module._get_flash_attention_varlen()
+    finally:
+        transformer_encoder_utils_module._import_flash_attn_varlen.cache_clear()
 
 
 def test_flash_attention_varlen_prefers_flash_attn(monkeypatch):
@@ -748,3 +756,15 @@ def _make_fake_flash_attn_module():
 def _fake_flash_attn_varlen(*args, **kwargs):
     """Stand in for flash_attn.flash_attn_varlen_func, which the lookup returns without calling."""
     raise AssertionError("not called")
+
+
+def _make_import_raising(import_error):
+    """Return an ``__import__`` that raises ``import_error`` for flash_attn and imports everything else."""
+    original_import = builtins.__import__
+
+    def import_broken_flash_attn(name, *args, **kwargs):
+        if name == "flash_attn":
+            raise import_error("undefined symbol")
+        return original_import(name, *args, **kwargs)
+
+    return import_broken_flash_attn

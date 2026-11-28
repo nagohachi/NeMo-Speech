@@ -194,13 +194,15 @@ def _forward_sequence_packed_layer(layer, x, **kwargs):
 
 @lru_cache(maxsize=1)
 def _import_flash_attn_varlen():
-    """Import ``flash_attn_varlen_func`` from flash-attn, or return ``None`` for a build that cannot be imported."""
+    """Import ``flash_attn_varlen_func`` from flash-attn, or return ``None`` when the import raises ImportError."""
     try:
         from flash_attn import flash_attn_varlen_func
-    except Exception as error:  # ImportError, or OSError / RuntimeError from a CUDA extension built for another ABI
+    except ImportError as error:  # other errors of a broken build (OSError, RuntimeError) propagate
         logging.warning(f"flash-attn is installed but cannot be imported ({error}); using the ATen FlashAttention.")
         return None
     return flash_attn_varlen_func
 
 
+# Whether flash-attn is installed, found with find_spec without importing it: the import loads a CUDA extension,
+# which importing this module should not pay for, and is left to the first lookup (_import_flash_attn_varlen)
 _FLASH_ATTN_INSTALLED = is_lib_available("flash_attn")
