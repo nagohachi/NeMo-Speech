@@ -165,7 +165,9 @@ The model raises at setup for the settings the packed step does not support:
 
 * ``pack_sequences`` in ``validation_ds`` or ``test_ds``: evaluation runs on padded batches;
 * a Transformer encoder between encoder and decoder (``transf_encoder.num_layers`` above 0);
-* ``loss.predict_last_k`` other than 0, which would keep the last tokens of the whole packed batch.
+* ``loss.predict_last_k`` other than 0, which would keep the last tokens of the whole packed batch;
+* an encoder without ``forward_sequence_packed`` (``ConformerEncoder`` has one);
+* adapters on the CTC head of ``model.aux_ctc``.
 
 The packed step logs the losses, ``learning_rate``, ``batch_size``, ``num_frames`` and ``num_tokens``; its batches have no padding, so it does not log ``input_to_padding_ratio`` and ``output_to_padding_ratio``,
 and it does not decode its batch, so it logs no ``training_batch`` metrics.
