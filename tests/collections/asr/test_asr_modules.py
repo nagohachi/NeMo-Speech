@@ -245,7 +245,7 @@ class TestASRModulesBasicTests:
     ):
         """Check that compile_packed in training mode (dither on) gives the eager frontend's features up to float32
         rounding for two batches of different sizes, from graphs without breaks that the second batch reuses."""
-        options = dict(
+        preprocessor_kwargs = dict(
             normalize=normalize,
             dither=1e-5,
             pad_to=0,
@@ -253,11 +253,13 @@ class TestASRModulesBasicTests:
             preemph=preemph,
             frame_splicing=frame_splicing,
         )
-        eager = modules.AudioToMelSpectrogramPreprocessor(**options).train().to(device)
-        compiled = modules.AudioToMelSpectrogramPreprocessor(**options, compile_packed=True).train().to(device)
+        eager_preprocessor = modules.AudioToMelSpectrogramPreprocessor(**preprocessor_kwargs).train().to(device)
+        compiled_preprocessor = (
+            modules.AudioToMelSpectrogramPreprocessor(**preprocessor_kwargs, compile_packed=True).train().to(device)
+        )
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
-        _assert_compiled_packed_frontend_matches_eager(eager, compiled, device)
+        _assert_compiled_packed_frontend_matches_eager(eager_preprocessor, compiled_preprocessor, device)
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
@@ -275,12 +277,16 @@ class TestASRModulesBasicTests:
         clamp guard of the logarithm, magnitudes without squaring, linear spectra) against the eager frontend."""
         options = dict(options)
         linear_spec = options.pop("linear_spec", False)
-        common = dict(dither=1e-5, pad_to=0, **options)
-        eager = modules.AudioToMelSpectrogramPreprocessor(**common).train()
-        compiled = modules.AudioToMelSpectrogramPreprocessor(**common, compile_packed=True).train()
+        preprocessor_kwargs = dict(dither=1e-5, pad_to=0, **options)
+        eager_preprocessor = modules.AudioToMelSpectrogramPreprocessor(**preprocessor_kwargs).train()
+        compiled_preprocessor = modules.AudioToMelSpectrogramPreprocessor(
+            **preprocessor_kwargs, compile_packed=True
+        ).train()
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
-        _assert_compiled_packed_frontend_matches_eager(eager, compiled, "cpu", linear_spec=linear_spec)
+        _assert_compiled_packed_frontend_matches_eager(
+            eager_preprocessor, compiled_preprocessor, "cpu", linear_spec=linear_spec
+        )
 
     @pytest.mark.unit
     def test_AudioToMelSpectrogramPreprocessor_packed_waveform_validates_metadata(self):
@@ -1111,7 +1117,9 @@ class TestASRModulesBasicTests:
         assert jointnet.num_classes_with_blank == vocab_size + 1
 
 
-def _assert_compiled_packed_frontend_matches_eager(eager, compiled, device, linear_spec=False):
+def _assert_compiled_packed_frontend_matches_eager(
+    eager_preprocessor, compiled_preprocessor, device, linear_spec=False
+):
     """Assert that two batches of different sizes give the eager features through the compiled packed frontend,
     without graph breaks, and that the second batch compiles no new graph."""
     graphs_per_batch = []
@@ -1123,7 +1131,7 @@ def _assert_compiled_packed_frontend_matches_eager(eager, compiled, device, line
         packed = torch.randn(int(lengths.sum()), device=device) * 0.1
         cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(dim=0)])
         outputs = []
-        for preprocessor in (eager, compiled):
+        for preprocessor in (eager_preprocessor, compiled_preprocessor):
             torch.manual_seed(5)  # the same dither noise
             # the same narrowband choices, drawn from the Python RNG of the featurizer: with seed 0 and probability
             # 0.5 both batches mix narrowband utterances with full-band ones

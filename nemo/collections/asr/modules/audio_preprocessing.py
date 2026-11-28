@@ -234,7 +234,7 @@ class AudioToMelSpectrogramPreprocessor(AudioPreprocessor, Exportable):
             Defaults to None
         compile_packed: Run the device work of the sequence-packed frontend (`forward_packed`) before and after its
             STFT through `torch.compile` with dynamic sizes; the STFT itself stays eager. The features equal the
-            eager ones up to float32 rounding; the dither noise is drawn eagerly, so both draw the same samples.
+            eager ones up to float32 rounding; with the same seed, the dither is the same with and without it.
             The padded `forward` is unaffected.
             Defaults to False
         stft_exact_pad: Deprecated argument, kept for compatibility with older checkpoints.
