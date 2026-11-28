@@ -34,8 +34,8 @@ pytestmark = [
 
 # lengths shorter than, equal to and longer than the kernels, single frames among them
 LENGTHS = [300, 1, 2, 3, 77, 9, 160, 4]
-# (num_channels, kernel_size, [left, right] context): the c180 geometry, an even kernel, a causal one,
-# channel counts that do not fill the channel tiles
+# (num_channels, kernel_size, [left, right] context): d_model 512 with a symmetric kernel of 9, an even kernel,
+# a causal one, channel counts that do not fill the channel tiles
 GEOMETRIES = [(512, 9, [4, 4]), (48, 9, [4, 4]), (40, 4, [1, 2]), (24, 5, [4, 0])]
 
 
@@ -116,21 +116,23 @@ def test_empty_input_returns_empty_output_and_zero_gradients():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "x_shape,weight_shape,num_slots,left_padding,match",
+    "x_shape,weight_shape,bias_shape,num_slots,left_padding,match",
     [
-        ((5, 8), (8, 1, 9), 5, 9, "left_padding"),
-        ((5, 8), (4, 1, 9), 5, 4, "weight"),
-        ((5, 8, 1), (8, 1, 9), 5, 4, "x must be"),
-        ((5, 8), (8, 1, 9), 4, 4, "token_slots"),
+        ((5, 8), (8, 1, 9), None, 5, 9, "left_padding"),
+        ((5, 8), (8, 1, 9), None, 5, -1, "left_padding"),
+        ((5, 8), (4, 1, 9), None, 5, 4, "weight"),
+        ((5, 8), (8, 1, 9), (4,), 5, 4, "bias must be"),
+        ((5, 8, 1), (8, 1, 9), None, 5, 4, "x must be"),
+        ((5, 8), (8, 1, 9), None, 4, 4, "token_slots"),
     ],
 )
-def test_rejects_inconsistent_arguments(x_shape, weight_shape, num_slots, left_padding, match):
+def test_rejects_inconsistent_arguments(x_shape, weight_shape, bias_shape, num_slots, left_padding, match):
     """Check that shapes and a left padding that do not fit together raise ValueError."""
     with pytest.raises(ValueError, match=match):
         run_packed_depthwise_conv1d(
             torch.zeros(x_shape, device="cuda"),
             torch.zeros(weight_shape, device="cuda"),
-            None,
+            None if bias_shape is None else torch.zeros(bias_shape, device="cuda"),
             torch.arange(num_slots, device="cuda"),
             left_padding,
         )
