@@ -630,7 +630,7 @@ class FilterbankFeatures(nn.Module):
             frame_sequence_ids,
             self.log,
             self.log_zero_guard_type,
-            self.log_zero_guard_value_fn(spectra),
+            self.log_zero_guard_value_fn(spectra) if self.log else None,  # forward checks the guard only with log
             self.log_base,
             self.frame_splicing,
             None if self.norm is not None else self.normalize,

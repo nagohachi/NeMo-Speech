@@ -289,6 +289,23 @@ class TestASRModulesBasicTests:
         )
 
     @pytest.mark.unit
+    def test_AudioToMelSpectrogramPreprocessor_packed_without_log_ignores_the_log_zero_guard(self):
+        """Check that without the logarithm the packed frontend, like forward, does not evaluate the zero guard of the
+        logarithm, so a value that the guard would refuse leaves the features of forward."""
+        preprocessor = modules.AudioToMelSpectrogramPreprocessor(
+            log=False, log_zero_guard_value="not a guard", dither=0.0, pad_to=0
+        ).eval()
+        lengths = torch.tensor([4000, 2500])
+        padded = torch.randn(2, 4000) * 0.1
+        expected, expected_lengths = preprocessor(input_signal=padded, length=lengths)
+        packed = torch.cat([padded[0], padded[1, :2500]])
+        cu_seqlens = torch.tensor([0, 4000, 6500])
+        actual = preprocessor.forward_packed(packed, lengths, cu_seqlens)
+        assert torch.equal(actual.lengths, expected_lengths)
+        expected_data = torch.cat([expected[i, :, :n].T for i, n in enumerate(expected_lengths.tolist())])
+        torch.testing.assert_close(actual.data, expected_data, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.unit
     def test_AudioToMelSpectrogramPreprocessor_packed_waveform_validates_metadata(self):
         preprocessor = modules.AudioToMelSpectrogramPreprocessor(dither=0, pad_to=0)
         packed = torch.zeros(6)
