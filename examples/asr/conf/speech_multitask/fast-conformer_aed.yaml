@@ -93,6 +93,8 @@ model:
     # use_bucketing: false, batch_duration: null, use_packed_sequence_sampling: true and a batch_tokens budget.
     # The packed training step logs no training_batch metrics. Evaluation datasets do not accept it.
     # pack_sequences: true
+    # with pack_sequences: the waveforms stay int16 from decoding to the GPU (half the bytes to collate, pin and copy)
+    # int16_audio: true
 
 
   validation_ds:

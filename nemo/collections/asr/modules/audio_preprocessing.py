@@ -40,6 +40,10 @@ from nemo.utils import logging, logging_mode
 if NUMBA_CUDA_AVAILABLE:
     from nemo.collections.asr.parts.numba.spec_augment import SpecAugmentNumba, spec_augment_launch_heuristics
 
+# int16 samples divided by this are the float32 samples that soundfile reads from 16-bit PCM audio, exactly;
+# the int16_audio datasets read such samples and forward_packed converts them
+INT16_AUDIO_SCALE = 32768
+
 __all__ = [
     'AudioToMelSpectrogramPreprocessor',
     'AudioToMFCCPreprocessor',
@@ -104,7 +108,9 @@ class AudioPreprocessor(NeuralModule, ABC):
         and checkpoint state remain unchanged.
 
         Args:
-            input_signal: Concatenated waveform samples with shape `(sum(length),)`.
+            input_signal: Concatenated waveform samples with shape `(sum(length),)`: float32 in [-1, 1),
+                or int16 samples (``train_ds.int16_audio``), which are divided by ``INT16_AUDIO_SCALE`` here
+                on the device of the signal. Only this packed method takes int16 samples; ``forward`` does not.
             length: Per-waveform sample counts with shape `(B,)`.
             input_signal_cu_seqlens: Cumulative sample offsets with shape `(B + 1,)`.
             host_length: `length` on the host (a CPU tensor or a sequence of ints), when the caller knows it,
@@ -115,7 +121,10 @@ class AudioPreprocessor(NeuralModule, ABC):
         Returns:
             Packed time-major features and their sequence metadata, including a host copy of the frame counts.
         """
-        if input_signal.dtype != torch.float32:
+        if input_signal.dtype == torch.int16:
+            # the float32 samples that soundfile reads from 16-bit audio, exactly: a power of two scales the integers
+            input_signal = input_signal.to(torch.float32) / INT16_AUDIO_SCALE
+        elif input_signal.dtype != torch.float32:
             logging.warning(
                 f"AudioPreprocessor received an input signal of dtype {input_signal.dtype}, rather than "
                 "torch.float32. Packed preprocessing runs in float32 for numerical stability.",

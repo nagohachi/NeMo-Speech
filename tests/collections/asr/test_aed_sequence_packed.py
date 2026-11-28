@@ -19,6 +19,7 @@ import traceback
 from collections import namedtuple
 
 import pytest
+import soundfile
 import torch
 from lhotse import AudioSource, CutSet, Recording
 from lhotse.testing.random import deterministic_rng  # noqa: F401
@@ -34,6 +35,7 @@ from nemo.collections.asr.data.audio_to_text_lhotse_prompted import (
     PromptedAudioToTextLhotseDataset,
 )
 from nemo.collections.asr.models.aed_multitask_models import EncDecMultiTaskModel
+from nemo.collections.asr.modules.audio_preprocessing import INT16_AUDIO_SCALE
 from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 from nemo.collections.asr.parts.packed_sequence import pack_encoder_output
 from nemo.collections.common.data import apply_prompt_format_fn
@@ -68,6 +70,96 @@ def test_packed_batch_matches_padded_batch(asr_model, cuts):
     assert torch.equal(packed.transcript, padded.transcript)
     assert packed.max_decoder_len == int((padded.prompted_transcript_lens - 1).max())
     assert packed.host_audio_lens == tuple(padded.audio_lens.tolist())
+
+
+@pytest.mark.unit
+def test_int16_audio_packed_batch_scales_to_the_float_batch(asr_model, cuts):
+    """Check that with int16_audio the packed batch carries the 16-bit samples, which divided by INT16_AUDIO_SCALE
+    are the float32 samples."""
+    _, packed_ds = _make_datasets(asr_model)
+    float_batch, int16_batch = packed_ds[cuts], _make_int16_dataset(asr_model)[cuts]
+
+    assert int16_batch.audio.dtype == torch.int16
+    assert torch.equal(int16_batch.audio.to(torch.float32) / INT16_AUDIO_SCALE, float_batch.audio)
+    for name, value in vars(float_batch).items():
+        if torch.is_tensor(value) and name != "audio":
+            assert torch.equal(getattr(int16_batch, name), value), name
+    assert int16_batch.host_audio_lens == float_batch.host_audio_lens
+
+
+@pytest.mark.unit
+def test_int16_audio_gives_the_float_features(asr_model, cuts):
+    """Check that the packed preprocessor scales int16 audio itself: the features of the float audio, bit for bit."""
+    asr_model.eval()
+    _, packed_ds = _make_datasets(asr_model)
+    float_features, int16_features = (
+        _calc_packed_features(asr_model, batch) for batch in (packed_ds[cuts], _make_int16_dataset(asr_model)[cuts])
+    )
+    assert torch.equal(int16_features.data, float_features.data)
+    assert torch.equal(int16_features.lengths, float_features.lengths)
+
+
+@pytest.mark.unit
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_int16_audio_gives_the_float_features_on_cuda(asr_model, cuts):
+    """Check that the int16 audio is scaled on the GPU: the CUDA features of the float audio, bit for bit."""
+    asr_model = asr_model.cuda().eval()
+    _, packed_ds = _make_datasets(asr_model)
+    float_features, int16_features = (
+        _calc_packed_features(asr_model, _move_to_cuda(batch))
+        for batch in (packed_ds[cuts], _make_int16_dataset(asr_model)[cuts])
+    )
+    assert torch.equal(int16_features.data, float_features.data)
+
+
+@pytest.mark.unit
+def test_int16_audio_without_pack_sequences_is_refused_at_setup(asr_model):
+    """Check that the model setup refuses train_ds.int16_audio without pack_sequences before building the loader."""
+    with pytest.raises(ValueError, match="train_ds.int16_audio needs train_ds.pack_sequences"):
+        asr_model.setup_training_data(OmegaConf.create({"use_lhotse": True, "int16_audio": True}))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", ["validation_ds", "test_ds"])
+def test_evaluation_data_refuses_int16_audio(asr_model, name):
+    """Check that evaluation datasets refuse int16_audio, which only the packed training batches carry."""
+    config = OmegaConf.create({"use_lhotse": True, "int16_audio": True})
+    setup = asr_model.setup_validation_data if name == "validation_ds" else asr_model.setup_test_data
+    with pytest.raises(ValueError, match=f"{name}.int16_audio"):
+        setup(config)
+
+
+@pytest.mark.unit
+def test_int16_audio_needs_pack_sequences(asr_model):
+    """Check that int16_audio without pack_sequences raises: only the packed batches carry int16 audio."""
+    with pytest.raises(ValueError, match="int16_audio needs pack_sequences"):
+        PromptedAudioToTextLhotseDataset(
+            tokenizer=asr_model.tokenizer, prompt=CanaryPromptFormatter(asr_model.tokenizer), int16_audio=True
+        )
+
+
+@pytest.mark.unit
+def test_int16_audio_refuses_cuts_it_cannot_read_as_lhotse_does(asr_model, cuts):
+    """Check that the reader raises for a cut whose float samples come out of a transform (here resampling), which
+    has no exact int16 form, even when it drops cuts with unreadable audio."""
+    dataset = _make_int16_dataset(asr_model)
+    for fault_tolerant in (False, True):
+        with pytest.raises(ValueError, match="audio transforms"):
+            dataset.with_fault_tolerant_audio_loading(fault_tolerant)[cuts.resample(8000)]
+
+
+@pytest.mark.unit
+def test_int16_audio_drops_unreadable_cuts_only_when_fault_tolerant(asr_model, cuts):
+    """Check that a cut whose audio fails to decode raises, or is dropped with fault-tolerant audio loading."""
+    cuts = cuts.to_eager()
+    cuts[1].recording.sources[0].source = b"not audio"
+    dataset = _make_int16_dataset(asr_model)
+    with pytest.raises(soundfile.LibsndfileError):
+        dataset.with_fault_tolerant_audio_loading(False)[cuts]
+    batch = dataset.with_fault_tolerant_audio_loading(True)[cuts]
+    assert [cut.id for cut in batch.cuts] == [cuts[0].id, cuts[2].id]
+    assert batch.audio.dtype == torch.int16 and len(batch.host_audio_lens) == 2
 
 
 @pytest.mark.unit
@@ -455,6 +547,23 @@ def test_packed_training_loader_through_model_setup(tmp_path, monkeypatch, asr_m
 
 
 @pytest.mark.unit
+def test_int16_audio_through_model_setup(tmp_path, asr_model, cuts):
+    """Check that train_ds.int16_audio reaches the dataset of the model setup, which reads the audio files as int16."""
+    path = _save_cuts(cuts, tmp_path)
+    config = _make_loader_config(path, pin_memory=False)
+    config.int16_audio = True
+
+    asr_model.setup_training_data(config)
+    batch = next(iter(asr_model._train_dl))
+
+    expected = PromptedAudioToTextLhotseDataset(
+        tokenizer=asr_model.tokenizer, prompt=asr_model.prompt, pack_sequences=True
+    )[CutSet.from_file(path)]
+    assert batch.audio.dtype == torch.int16
+    assert torch.equal(batch.audio.to(torch.float32) / INT16_AUDIO_SCALE, expected.audio)
+
+
+@pytest.mark.unit
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinning needs CUDA")
 def test_packed_training_loader_pins_memory(tmp_path, asr_model, cuts):
@@ -569,6 +678,20 @@ def _make_datasets(model):
     padded = PromptedAudioToTextLhotseDataset(tokenizer=model.tokenizer, prompt=prompt)
     packed = PromptedAudioToTextLhotseDataset(tokenizer=model.tokenizer, prompt=prompt, pack_sequences=True)
     return padded, packed
+
+
+def _calc_packed_features(model, batch):
+    """Return the packed features of the preprocessor of ``model`` for a packed batch."""
+    with torch.no_grad():
+        return model.preprocessor.forward_packed(
+            batch.audio, batch.audio_lens, batch.audio_cu_seqlens, host_length=batch.host_audio_lens
+        )
+
+
+def _make_int16_dataset(model):
+    return PromptedAudioToTextLhotseDataset(
+        tokenizer=model.tokenizer, prompt=CanaryPromptFormatter(model.tokenizer), pack_sequences=True, int16_audio=True
+    )
 
 
 def _move_to_cuda(batch):

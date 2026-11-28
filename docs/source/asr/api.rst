@@ -163,7 +163,8 @@ and ``training_step`` runs the preprocessor, ``ConformerEncoder.forward_sequence
 Fill such batches to a budget of encoder frames with ``use_packed_sequence_sampling: true`` and ``batch_tokens`` (see the Lhotse dataloading documentation).
 The model raises at setup for the settings the packed step does not support:
 
-* ``pack_sequences`` in ``validation_ds`` or ``test_ds``: evaluation runs on padded batches;
+* ``pack_sequences`` or ``int16_audio`` in ``validation_ds`` or ``test_ds``: evaluation runs on padded batches;
+* ``int16_audio`` in ``train_ds`` without ``pack_sequences``: only the packed batches carry int16 audio;
 * a Transformer encoder between encoder and decoder (``transf_encoder.num_layers`` above 0);
 * ``loss.predict_last_k`` other than 0, which would keep the last tokens of the whole packed batch;
 * an encoder without ``forward_sequence_packed`` (``ConformerEncoder`` has one);
@@ -173,6 +174,10 @@ The packed step logs the losses, ``learning_rate``, ``batch_size``, ``num_frames
 and it does not decode its batch, so it logs no ``training_batch`` metrics.
 
 In multi-GPU training, ``encoder.sync_max_audio_length: false`` keeps the encoder from reading the longest length across ranks back to the host at every step.
+
+With ``model.train_ds.int16_audio: true`` as well, the data loader workers decode the waveforms as 16-bit integers and keep them as ``int16`` through collation, pinning and the copy to the GPU (half the bytes of ``float32``);
+the preprocessor's ``forward_packed`` divides them by 32768 on the GPU, which gives the ``float32`` samples of the default path bit for bit.
+It reads single-source mono 16-bit PCM recordings from files or from memory (tarred datasets) without audio transforms and raises on other cuts, also with fault-tolerant audio loading.
 
 ``model.encoder.compile_packed_layers: true`` compiles the layers of the sequence-packed encoder forward with ``torch.compile``,
 and ``model.transf_decoder.config_dict.compile_packed_layers: true`` the blocks of the packed decoder forward,

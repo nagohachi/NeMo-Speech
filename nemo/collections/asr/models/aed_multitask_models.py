@@ -664,12 +664,14 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
             # Adding this to support processing audio files of arbitrary length by chunking them into hour-long segments.
             config.cut_into_windows_duration = 3600
             config.cut_into_windows_hop = 3600
-        # pack_sequences configures the dataset, not the Lhotse dataloader (which would log it as an ignored key);
-        # the copy without it is resolved while the config is still attached to the model config
+        # pack_sequences and int16_audio configure the dataset, not the Lhotse dataloader (which would log them as
+        # ignored keys); the copy without them is resolved while the config is still attached to the model config
         pack_sequences = config.get("pack_sequences", False)
-        if "pack_sequences" in config:
+        int16_audio = config.get("int16_audio", False)
+        if "pack_sequences" in config or "int16_audio" in config:
             config = OmegaConf.to_container(config, resolve=True) if isinstance(config, DictConfig) else dict(config)
-            del config["pack_sequences"]
+            config.pop("pack_sequences", None)
+            config.pop("int16_audio", None)
         return get_lhotse_dataloader_from_config(
             config,
             global_rank=global_rank,
@@ -680,6 +682,8 @@ class EncDecMultiTaskModel(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRModu
                 enable_chunking=enable_chunking,  # <-- enables chunking
                 # token-flat batches for the sequence-packed teacher forcing of training_step
                 pack_sequences=pack_sequences,
+                # int16_audio: keep the packed waveforms as int16 up to the preprocessor
+                int16_audio=int16_audio,
             ),
             tokenizer=self.tokenizer,
         )
@@ -1659,7 +1663,14 @@ def _check_packed_training_config(
     ``train_ds.pack_sequences`` makes ``training_step`` run ``_run_packed_training_step`` on sequence-packed batches.
     ``ctc_decoder`` is the head of the auxiliary CTC loss, or None without it.
     """
-    if not train_data_config or not train_data_config.get("pack_sequences", False):
+    if not train_data_config:
+        return
+    if not train_data_config.get("pack_sequences", False):
+        if train_data_config.get("int16_audio", False):
+            raise ValueError(
+                "train_ds.int16_audio needs train_ds.pack_sequences: only the sequence-packed batches carry int16 "
+                "audio, which the preprocessor's forward_packed converts."
+            )
         return
     if not hasattr(encoder, "forward_sequence_packed"):
         raise ValueError(
@@ -1682,9 +1693,11 @@ def _check_packed_training_config(
 
 
 def _refuse_sequence_packing(config, name: str):
-    """Raise if an evaluation dataset config asks for sequence packing, which only ``training_step`` handles."""
-    if config.get("pack_sequences", False):
-        raise ValueError(
-            f"{name}.pack_sequences: only the training step runs on sequence-packed batches; "
-            "evaluation needs padded batches. Remove pack_sequences from this config."
-        )
+    """Raise if an evaluation dataset config asks for sequence packing or int16 audio, which only ``training_step``
+    handles."""
+    for key in ("pack_sequences", "int16_audio"):
+        if config.get(key, False):
+            raise ValueError(
+                f"{name}.{key}: only the training step runs on sequence-packed batches (and their int16 audio); "
+                f"evaluation needs padded batches. Remove {key} from this config."
+            )

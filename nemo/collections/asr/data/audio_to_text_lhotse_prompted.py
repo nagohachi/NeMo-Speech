@@ -60,7 +60,8 @@ class PackedPromptedAudioToTextMiniBatch:
     the target the prompted transcript without the first token, so both have ``prompted_transcript_lens - 1`` tokens.
 
     Args:
-        audio: concatenated waveforms, shape ``(sum(audio_lens),)``.
+        audio: concatenated waveforms, shape ``(sum(audio_lens),)``: float32 samples in [-1, 1),
+            or int16 samples (the float32 samples times ``INT16_AUDIO_SCALE``) from a dataset with ``int16_audio``.
         audio_lens: samples per utterance, shape ``(B,)``.
         audio_cu_seqlens: cumulative samples, shape ``(B + 1,)``.
         decoder_input_ids: concatenated decoder inputs, shape ``(sum(prompted_transcript_lens - 1),)``.
@@ -116,6 +117,13 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
     (see `find_optimal_chunk_size` and `chunk_waveform`). This is useful for long audio inputs,
     allowing the model to process them in manageable segments.
 
+    Sequence packing:
+    With `pack_sequences` the dataset returns a ``PackedPromptedAudioToTextMiniBatch``: the waveforms of all
+    utterances in one row, without padding. With `int16_audio` as well, the waveforms stay 16-bit integers from the
+    decoder to the GPU (half the bytes to collate, pin and copy); the model's preprocessor divides them by
+    ``INT16_AUDIO_SCALE``, which gives the float32 samples of the default path bit for bit.
+    It reads single-source mono recordings from files or from memory (tarred datasets) and raises on other cuts.
+
     NOTE:
     If the environment variable `USE_AIS_GET_BATCH` is set to `true` (case-insensitive),
     then batch audio loading from AIStore will be enabled for this dataset. This will use the
@@ -128,11 +136,15 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
         prompt: PromptFormatter,
         enable_chunking: bool = False,
         pack_sequences: bool = False,
+        int16_audio: bool = False,
     ):
         super().__init__()
         if pack_sequences and enable_chunking:
             raise ValueError("pack_sequences and enable_chunking cannot be combined.")
+        if int16_audio and not pack_sequences:
+            raise ValueError("int16_audio needs pack_sequences: only the sequence-packed batches carry int16 audio.")
         self.pack_sequences = pack_sequences
+        self.int16_audio = int16_audio
         self.tokenizer = tokenizer
         self.use_ais_get_batch = os.environ.get("USE_AIS_GET_BATCH", "False").lower() == "true"
         self.ais_force_individual = os.environ.get("USE_AIS_INDIVIDUAL_GETS", "False").lower() == "true"
@@ -189,7 +201,7 @@ class PromptedAudioToTextLhotseDataset(LhotseAudioLoadingDatasetMixin, torch.uti
 
     def _get_packed_batch(self, cuts: CutSet) -> PackedPromptedAudioToTextMiniBatch:
         num_cuts = len(cuts)
-        rows, cuts = read_unpadded_audio_rows(cuts, self.load_audio)
+        rows, cuts = read_unpadded_audio_rows(cuts, self.load_audio, int16=self.int16_audio)
         if not rows:
             raise ValueError(
                 f"The audio of none of the {num_cuts} cuts of the batch could be loaded: "
