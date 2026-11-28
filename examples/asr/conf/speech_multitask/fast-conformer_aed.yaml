@@ -37,7 +37,6 @@ model:
   label_smoothing: 0.0
   use_loss_mask_for_prompt: false
   log_prediction: true # enables logging sample predictions in the output during training
-
   # Auxiliary CTC loss on the encoder output (hybrid CTC/attention training):
   # loss = (1 - ctc_loss_weight) * attention loss + ctc_loss_weight * CTC loss.
   # ctc_reduction mean_volume (the default) divides the CTC loss by the number of target tokens, like the attention loss.
