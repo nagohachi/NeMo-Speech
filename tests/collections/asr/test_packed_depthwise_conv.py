@@ -16,6 +16,7 @@
 
 import pytest
 import torch
+from torch._dynamo.testing import CompileCounterWithBackend
 
 from nemo.collections.asr.parts.packed_sequence import pack_encoder_output, packed_slot_layout
 from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
@@ -41,9 +42,18 @@ GEOMETRIES = [(512, 9, [4, 4]), (48, 9, [4, 4]), (40, 4, [1, 2]), (24, 5, [4, 0]
 @pytest.mark.unit
 @pytest.mark.parametrize("has_bias", [True, False])
 @pytest.mark.parametrize("num_channels,kernel_size,context", GEOMETRIES)
-def test_matches_gapped_convolution_in_float32(num_channels, kernel_size, context, has_bias):
-    """Check the output and the input, weight and bias gradients against the float64 gapped-slot convolution."""
-    conv, layout, x, grad = _make_case(num_channels, kernel_size, context, has_bias)
+@pytest.mark.parametrize(
+    "extra_gap,alignment",
+    [(0, 1), (4, 1), (0, 8)],
+    ids=["smallest_gap", "wider_gap", "gaps_that_differ_per_utterance"],
+)
+def test_matches_gapped_convolution_in_float32(num_channels, kernel_size, context, has_bias, extra_gap, alignment):
+    """Check the output and the input, weight and bias gradients against the float64 gapped-slot convolution, with
+    the smallest gap the kernel needs (kernel_size - 1), a wider one, and slots aligned to 8 frames, whose gaps
+    differ from utterance to utterance."""
+    conv, layout, x, grad = _make_case(
+        num_channels, kernel_size, context, has_bias, gap=kernel_size - 1 + extra_gap, alignment=alignment
+    )
     expected, expected_grads = _run_gapped(conv.double(), layout, x.double(), grad.double())
     conv.float()
     out, grads = _run_kernel(conv, layout, x, grad)
@@ -74,8 +84,6 @@ def test_bf16_autocast_error_at_most_that_of_the_gapped_convolution(num_channels
 @pytest.mark.unit
 def test_compiles_without_graph_breaks_for_new_frame_counts():
     """Check that with fullgraph and dynamic shapes a second frame count runs the same graph and matches eager."""
-    from torch._dynamo.testing import CompileCounterWithBackend
-
     conv, layout, x, grad = _make_case(48, 9, [4, 4], has_bias=True)
     torch._dynamo.reset()
     counter = CompileCounterWithBackend("inductor")
@@ -146,7 +154,10 @@ def _calc_squared_conv_sum(x, weight, bias, token_slots):
     return run_packed_depthwise_conv1d(x, weight, bias, token_slots, 4).square().sum()
 
 
-def _make_case(num_channels, kernel_size, context, has_bias, lengths=LENGTHS):
+def _make_case(num_channels, kernel_size, context, has_bias, lengths=LENGTHS, gap=None, alignment=1):
+    """Return a depthwise CausalConv1D, the slot layout of packed random features (``gap`` empty frames after every
+    utterance, ``kernel_size - 1`` by default, and slots aligned to ``alignment``), the features and an output
+    gradient."""
     torch.manual_seed(0)
     conv = CausalConv1D(
         num_channels, num_channels, kernel_size, padding=context, groups=num_channels, bias=has_bias
@@ -154,7 +165,7 @@ def _make_case(num_channels, kernel_size, context, has_bias, lengths=LENGTHS):
     lengths = torch.tensor(lengths, device="cuda")
     features = torch.randn(len(lengths), int(lengths.max()), num_channels, device="cuda")
     packed = pack_encoder_output(features, lengths)
-    layout = packed_slot_layout(packed, gap=kernel_size - 1)
+    layout = packed_slot_layout(packed, alignment=alignment, gap=kernel_size - 1 if gap is None else gap)
     grad = torch.randn_like(packed.data)
     return conv, layout, packed.data, grad
 
@@ -177,7 +188,8 @@ def _calc_grads(out, x, conv, grad):
 
 
 def _calc_rel_error(actual, reference):
-    return float((actual.double() - reference).norm() / reference.norm())
+    """Return the norm of ``actual - reference`` relative to the norm of ``reference``."""
+    return float((actual.double() - reference).norm() / reference.norm().clamp(min=1e-30))
 
 
 def _assert_close(actual, expected, rtol):

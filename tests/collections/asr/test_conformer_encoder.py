@@ -56,6 +56,7 @@ from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 from nemo.core.utils.optional_libs import TRITON_AVAILABLE
 from tests.collections.asr.packed_compile_test_utils import clear_packed_compile_caches
+from tests.collections.asr.test_packed_depthwise_conv import _calc_rel_error
 
 
 class TestStochasticDepth:
@@ -1955,7 +1956,3 @@ def _calc_ddp_gradients(*, device, rank, self_attention_model, compile_packed_la
         weights = torch.randn(out.shape, generator=torch.Generator().manual_seed(3)).to(device)
         (out.float() * weights).sum().backward()
     return {name: p.grad.clone() for name, p in encoder.named_parameters() if p.grad is not None}
-
-
-def _calc_rel_error(actual, expected):
-    return float((actual - expected).norm() / expected.norm().clamp(min=1e-30))
