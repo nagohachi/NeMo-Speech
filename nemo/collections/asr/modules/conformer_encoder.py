@@ -417,6 +417,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             raise ValueError(f"packed_rel_pos_attention must be 'triton' or 'flex', got {packed_rel_pos_attention!r}.")
         self.packed_rel_pos_attention = packed_rel_pos_attention
         self.compile_packed_layers = compile_packed_layers
+        if compile_packed_layers:
+            compile_forward_packed()  # raises for a PyTorch it cannot patch now, not at the first training step
         self.global_tokens = global_tokens
         self.global_attn_separate = global_attn_separate
         self.global_tokens_spacing = global_tokens_spacing

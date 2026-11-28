@@ -304,6 +304,8 @@ class TransformerDecoder(nn.Module):
     ):
         super().__init__()
         self.compile_packed_layers = compile_packed_layers
+        if compile_packed_layers:
+            compile_forward_packed()  # raises for a PyTorch it cannot patch now, not at the first training step
 
         if pre_ln and pre_ln_final_layer_norm:
             self.final_layer_norm = build_module(norm or nn.LayerNorm, normalized_shape=hidden_size)

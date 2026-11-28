@@ -32,6 +32,7 @@ from torch.nn.parallel import DistributedDataParallel
 from nemo.collections.asr.models import EncDecCTCModel
 from nemo.collections.asr.modules import transformer_encoder_utils
 from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder
+from nemo.collections.asr.parts import packed_sequence as packed_sequence_module
 from nemo.collections.asr.parts.packed_sequence import (
     PackedEncoderActivations,
     pack_encoder_output,
@@ -740,6 +741,19 @@ class TestPackedConformerEncoder:
         lengths = torch.tensor([20, 13])
         with pytest.raises(ValueError, match="activation checkpointing"):
             encoder.forward_sequence_packed(_packed_test_features(lengths), lengths)
+
+    @pytest.mark.unit
+    def test_compiled_layers_refuse_a_pytorch_without_optimize_ddp_at_construction(self, monkeypatch):
+        """Check that compile_packed_layers raises when the encoder is built, not at the first training step, for a
+        PyTorch whose Dynamo config has no optimize_ddp to turn off."""
+        monkeypatch.delattr(torch._dynamo.config, "optimize_ddp")
+        packed_sequence_module.compile_forward_packed.cache_clear()
+        try:
+            with pytest.raises(RuntimeError, match="optimize_ddp"):
+                _packed_encoder(compile_packed_layers=True)
+            _packed_encoder()  # without the option nothing is compiled or checked
+        finally:
+            packed_sequence_module.compile_forward_packed.cache_clear()
 
     @pytest.mark.unit
     @pytest.mark.timeout(1200)  # two spawned processes that compile the layers in two precisions
