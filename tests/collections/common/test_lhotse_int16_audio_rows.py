@@ -129,6 +129,42 @@ def test_int16_rows_refuse_cuts_they_cannot_read_exactly(tmp_path, fault_toleran
             read_unpadded_audio_rows(CutSet([cut]), load_audio, dtype=torch.int16)
 
 
+@pytest.mark.unit
+def test_rows_refuse_a_dtype_other_than_float32_and_int16(tmp_path):
+    """Check that the reader raises for a sample dtype it has no reading for."""
+    cuts = CutSet([Recording.from_file(_write_audio(tmp_path / "talk.wav", num_samples=8000)).to_cut()])
+    with pytest.raises(ValueError, match="float32 or int16"):
+        read_unpadded_audio_rows(cuts, AudioSamples(), dtype=torch.float16)
+
+
+@pytest.mark.unit
+def test_int16_rows_from_worker_threads_keep_the_order_of_the_cuts_that_load(tmp_path):
+    """Check that with num_workers > 0 (the reads run in an executor) the int16 rows still equal the float32 rows of
+    whole and partial cuts in order, and a cut whose file is missing is dropped from rows and cuts with
+    fault-tolerant loading."""
+    recording = Recording.from_file(_write_audio(tmp_path / "talk.wav", num_samples=24000))
+    whole_cut = recording.to_cut()
+    missing_cut = _make_recording(tmp_path / "missing.wav", num_samples=8000).to_cut()
+    cuts = CutSet([whole_cut, missing_cut, whole_cut.truncate(offset=0.37, duration=0.5)])
+    load_audio = AudioSamples(num_workers=2, fault_tolerant=True)
+
+    float_rows, _ = read_unpadded_audio_rows(cuts, load_audio)
+    int16_rows, int16_cuts = read_unpadded_audio_rows(cuts, load_audio, dtype=torch.int16)
+
+    assert [cut.id for cut in int16_cuts] == [whole_cut.id, cuts[2].id]
+    assert [row.numel() for row in int16_rows] == [24000, 8000]
+    for int16_row, float_row in zip(int16_rows, float_rows, strict=True):
+        assert torch.equal(int16_row.to(torch.float32) / INT16_AUDIO_SCALE, float_row)
+
+
+@pytest.mark.unit
+def test_int16_rows_from_worker_threads_raise_for_audio_that_is_not_16_bit_pcm(tmp_path):
+    """Check that an unsupported file raises from a worker thread too, also with fault-tolerant loading."""
+    cuts = CutSet([Recording.from_file(_write_audio(tmp_path / "talk.wav", 8000, subtype="PCM_24")).to_cut()])
+    with pytest.raises(ValueError, match="not 16-bit PCM"):
+        read_unpadded_audio_rows(cuts, AudioSamples(num_workers=2, fault_tolerant=True), dtype=torch.int16)
+
+
 def _write_audio(path, num_samples, subtype="PCM_16"):
     """Write a mono file of random samples and return its path."""
     samples = np.random.default_rng(0).uniform(-0.5, 0.5, num_samples)

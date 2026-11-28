@@ -40,7 +40,6 @@ from nemo.collections.asr.modules.conv_asr import ConvASRDecoder
 from nemo.collections.asr.parts.packed_sequence import pack_encoder_output
 from nemo.collections.common.data import apply_prompt_format_fn
 from nemo.collections.common.data.lhotse import dataloader as lhotse_dataloader
-from nemo.collections.common.data.lhotse.audio_loading import read_unpadded_audio_rows
 from nemo.collections.common.parts.adapter_modules import LinearAdapterConfig
 from nemo.collections.common.prompts.canary import CanaryPromptFormatter
 
@@ -131,8 +130,6 @@ def test_int16_audio_refuses_cuts_it_cannot_read_as_lhotse_does(asr_model, cuts)
     for fault_tolerant in (False, True):
         with pytest.raises(ValueError, match="audio transforms"):
             dataset.with_fault_tolerant_audio_loading(fault_tolerant)[cuts.resample(8000)]
-    with pytest.raises(ValueError, match="float32 or int16"):
-        read_unpadded_audio_rows(cuts, _make_int16_dataset(asr_model).load_audio, dtype=torch.float16)
 
 
 @pytest.mark.unit
