@@ -51,6 +51,7 @@ from nemo.collections.common.data.lhotse.cutset import (
     guess_parse_cutset,
     read_cutset_from_config,
 )
+from nemo.collections.common.data.lhotse.echo import LazyEchoer
 from nemo.collections.common.data.lhotse.packed_sequence_sampler import (
     PackedSequenceDynamicBucketingSampler,
     PackedSequenceDynamicCutSampler,
@@ -210,7 +211,12 @@ class LhotseDataLoadingConfig:
     noise_mix_prob: float = 0.5
     #   b. On-the-fly 3-way speed perturbation.
     perturb_speed: bool = False
-    #   c. Cut concatenation (glue together multiple utterances into a single one)
+    #   c. Data echoing (Choi et al., 2019): every training example is yielded `echo_factor` times,
+    #      the copies spread at random over `echo_buffer_size` examples before sampling.
+    #      Reduces the storage reads per trained example when reading the data bounds the throughput.
+    echo_factor: int = 1
+    echo_buffer_size: int = 2000
+    #   d. Cut concatenation (glue together multiple utterances into a single one)
     concatenate_samples: bool = False
     concatenate_gap_seconds: float = 0.1
     concatenate_duration_factor: float = 1.0
@@ -822,6 +828,7 @@ def get_lhotse_dataloader_from_multi_config(
 
 def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=None) -> tuple[CutSampler, bool]:
     """Create a CutSampler from a dataloader config."""
+    _check_echo_options(config)
     # 1. Load a manifest as a Lhotse CutSet.
     cuts, use_iterable_dataset = read_cutset_from_config(config)
     use_iterable_dataset = determine_use_iterable_dataset(use_iterable_dataset, config)
@@ -981,6 +988,12 @@ def get_lhotse_sampler_from_config(config, global_rank, world_size, tokenizer=No
     if tokenizer is not None and config.pretokenize:
         cuts = cuts.filter(TokenPerSecondFilter(config.min_tps, config.max_tps))
         cuts = cuts.filter(TokenPerTokenFilter(config.min_tpt, config.max_tpt))
+
+    # Data echoing after filtering, so that the copies are sampled (bucketed, packed) like other examples.
+    if config.echo_factor != 1:  # _check_echo_options rejects a factor below 1
+        cuts = CutSet(
+            LazyEchoer(cuts, factor=config.echo_factor, buffer_size=config.echo_buffer_size, seed=config.shard_seed)
+        )
 
     # Select the strategy customizing Lhotse sampler behaviour.
     # Provides support for dynamic batch sizes, multimodal dataloading, 2D bucketing, etc.
@@ -1465,3 +1478,14 @@ def _cut_text_into_windows(cut, num_tokens: int, tokenizer) -> list:
         )
         ans.append(new_cut)
     return ans
+
+
+def _check_echo_options(config) -> None:
+    """Raise ``ValueError`` for data echoing options that ``get_lhotse_sampler_from_config`` cannot apply."""
+    if config.echo_factor < 1:
+        raise ValueError(f"echo_factor must be at least 1, got {config.echo_factor}.")
+    if config.echo_buffer_size < 1:
+        raise ValueError(f"echo_buffer_size must be positive, got {config.echo_buffer_size}.")
+    if config.echo_factor != 1 and config.use_stateful_dataloader:
+        # the echo buffer and its random order are not part of the sampler state that a resume restores
+        raise ValueError("echo_factor != 1 cannot be combined with use_stateful_dataloader=True.")

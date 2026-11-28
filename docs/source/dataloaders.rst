@@ -1826,6 +1826,21 @@ audio payload, configure:
   ``concatenate_duration_factor``, ``concatenate_merge_supervisions``,
   ``db_norm``.
 
+**Data echoing.** ``echo_factor``, ``echo_buffer_size``. With ``echo_factor: k``
+every example that passes the filters is used ``k`` times (Choi et al., 2019,
+"Faster Neural Network Training with Data Echoing"). With tarred or Lhotse Shar
+data the copies share the audio bytes already read, so storage reads per trained
+example drop by ``k`` while decoding runs for every copy; audio in separate files
+is read again for every copy. The copies are spread at random over a buffer of
+``echo_buffer_size`` examples before the sampler, held in every dataloader worker
+(with tarred or Shar data including the audio bytes); a bucketing sampler can still
+put a copy into the same mini-batch as its original. Processing applied before
+the sampler (noise mixing, speed perturbation, truncation) is the same for all
+copies; augmentation after sampling, such as SpecAugment, differs per copy.
+``echo_factor`` and ``echo_buffer_size`` must be at least 1, and echoing cannot
+be combined with ``use_stateful_dataloader: true``, whose saved state does not
+include the echo buffer.
+
 **Cut transforms.** ``truncate_duration``, ``truncate_offset_type``,
 ``cut_into_windows_duration``, ``cut_into_windows_hop``,
 ``pad_min_duration``, ``pad_direction``, ``cut_text_into_windows_tokens``,
