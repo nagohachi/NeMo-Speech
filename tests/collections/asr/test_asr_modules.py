@@ -257,15 +257,13 @@ class TestASRModulesBasicTests:
         compiled = modules.AudioToMelSpectrogramPreprocessor(**options, compile_packed=True).train().to(device)
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
-        # three utterances or more in both batches: the graphs guard on that (contiguity checks of (B, ...) tensors),
-        # which packed training batches always meet
         _assert_compiled_packed_frontend_matches_eager(eager, compiled, device)
 
     @pytest.mark.unit
     @pytest.mark.parametrize(
         "options",
         [
-            dict(nb_augmentation_prob=1.0, nb_max_freq=4000),
+            dict(nb_augmentation_prob=0.5, nb_max_freq=4000),
             dict(log_zero_guard_type="clamp"),
             dict(mag_power=1.0),
             dict(linear_spec=True),
@@ -1126,7 +1124,10 @@ def _assert_compiled_packed_frontend_matches_eager(eager, compiled, device, line
         cu_seqlens = torch.cat([lengths.new_zeros(1), lengths.cumsum(dim=0)])
         outputs = []
         for preprocessor in (eager, compiled):
-            torch.manual_seed(5)  # the same dither noise and narrowband draws
+            torch.manual_seed(5)  # the same dither noise
+            # the same narrowband choices, drawn from the Python RNG of the featurizer: with seed 0 and probability
+            # 0.5 both batches mix narrowband utterances with full-band ones
+            preprocessor.featurizer._rng.seed(0)
             if linear_spec:
                 outputs.append(
                     preprocessor.featurizer.forward_packed(
