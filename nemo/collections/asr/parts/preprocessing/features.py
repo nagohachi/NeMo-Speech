@@ -439,6 +439,10 @@ class FilterbankFeatures(nn.Module):
         self._rng = random.Random() if rng is None else rng
         # forward_packed runs its device work before and after the STFT through torch.compile
         self.compile_packed = compile_packed
+        if compile_packed:
+            # raises for a PyTorch it cannot patch now, not at the first training step
+            for function in (_guard_packed_waveforms, _calc_packed_power_spectra, _calc_packed_log_mel):
+                compile_packed_function(function)
         self.nb_augmentation_prob = nb_augmentation_prob
         if self.nb_augmentation_prob > 0.0:
             if nb_max_freq >= sample_rate / 2:

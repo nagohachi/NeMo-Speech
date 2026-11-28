@@ -36,6 +36,7 @@ from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.core.utils import numba_utils
 from nemo.core.utils.numba_utils import __NUMBA_MINIMUM_VERSION__
 from nemo.utils import config_utils, logging
+from tests.collections.asr.packed_compile_test_utils import clear_packed_compile_caches
 
 
 class TestASRModulesBasicTests:
@@ -287,6 +288,21 @@ class TestASRModulesBasicTests:
         _assert_compiled_packed_frontend_matches_eager(
             eager_preprocessor, compiled_preprocessor, "cpu", linear_spec=linear_spec
         )
+
+    @pytest.mark.unit
+    def test_AudioToMelSpectrogramPreprocessor_compile_packed_refuses_a_pytorch_without_optimize_ddp(
+        self, monkeypatch
+    ):
+        """Check that compile_packed raises when the preprocessor is built, not at the first packed batch, for a
+        PyTorch whose Dynamo config has no optimize_ddp to turn off."""
+        monkeypatch.delattr(torch._dynamo.config, "optimize_ddp")
+        clear_packed_compile_caches()
+        try:
+            with pytest.raises(RuntimeError, match="optimize_ddp"):
+                modules.AudioToMelSpectrogramPreprocessor(compile_packed=True)
+            modules.AudioToMelSpectrogramPreprocessor()  # without the option nothing is compiled or checked
+        finally:
+            clear_packed_compile_caches()
 
     @pytest.mark.unit
     def test_AudioToMelSpectrogramPreprocessor_packed_without_log_ignores_the_log_zero_guard(self):
